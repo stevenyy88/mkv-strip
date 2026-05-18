@@ -38,13 +38,13 @@ Grab the latest binary from [Releases](https://github.com/stevenyy88/mkv-strip/r
 mkv-strip list movie.mkv
 ```
 ```
-  # │ Type      │ Lang │ Flags          │ Name │ Codec
-─────┼───────────┼──────┼───────────────┼──────┼──────────────
-  1 │ video     │ und  │ enabled       │      │ V_MPEG4/ISO/AVC
-  2 │ audio     │ eng  │ default, enabled │    │ A_AC3
-  3 │ audio     │ jpn  │ enabled       │      │ A_AC3
-  4 │ subtitle  │ eng  │ default, enabled │    │ S_TEXT/UTF8
-  5 │ subtitle  │ spa  │ enabled       │      │ S_TEXT/UTF8
+  # │ Type      │ Lang │ Flags            │ Name │ Codec
+────┼───────────┼──────┼──────────────────┼──────┼──────────────
+  1 │ video     │ und  │ enabled          │      │ V_MPEG4/ISO/AVC
+  2 │ audio     │ eng  │ default, enabled │      │ A_AC3
+  3 │ audio     │ jpn  │ enabled          │      │ A_AC3
+  4 │ subtitle  │ eng  │ default, enabled │      │ S_TEXT/UTF8
+  5 │ subtitle  │ spa  │ enabled          │      │ S_TEXT/UTF8
 ```
 
 ### Strip tracks
