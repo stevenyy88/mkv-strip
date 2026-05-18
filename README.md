@@ -30,7 +30,12 @@ A tiny, fast, single-binary CLI tool written in pure Rust that reads and writes 
 
 ### Download
 
-Grab the latest binary from [Releases](https://github.com/stevenyy88/mkv-strip/releases) or build from source.
+Grab the latest binary from [mkv-strip-binaries/releases](https://github.com/stevenyy88/mkv-strip-binaries/releases) or build from source.
+
+| File | Platform | Size |
+|------|----------|------|
+| `mkv-strip-linux-x64` | Linux (x86-64) | ~1.8 MB |
+| `mkv-strip-windows-x64.exe` | Windows (x86-64) | ~2.2 MB |
 
 ### List tracks
 
