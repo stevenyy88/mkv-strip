@@ -32,10 +32,30 @@ A tiny, fast, single-binary CLI tool written in pure Rust that reads and writes 
 
 Grab the latest binary from the [`binaries/`](binaries/) directory or build from source.
 
-| File | Platform | Size |
-|------|----------|------|
-| [`binaries/mkv-strip-linux-x64`](binaries/mkv-strip-linux-x64) | Linux (x86-64) | ~1.8 MB |
-| [`binaries/mkv-strip-windows-x64.exe`](binaries/mkv-strip-windows-x64.exe) | Windows (x86-64) | ~2.2 MB |
+| File | Platform | Size | SHA256 |
+|------|----------|------|--------|
+| [`binaries/mkv-strip-linux-x64`](binaries/mkv-strip-linux-x64) | Linux (x86-64) | ~1.8 MB | `229ef8beedca49b5d38e04dca21741cb7df16688ae61ce4cb6341bd2c5035d61` |
+| [`binaries/mkv-strip-windows-x64.exe`](binaries/mkv-strip-windows-x64.exe) | Windows (x86-64) | ~2.2 MB | `ce578c3987aca8d42abc3b00cf0a52538f944ac21889cab6a1bec0e3c8625e22` |
+
+### Verify Download Authenticity
+
+After downloading, verify the SHA-256 checksum to confirm the file hasn't been tampered with:
+
+**Linux / macOS:**
+```bash
+sha256sum mkv-strip-linux-x64
+# Expected: 229ef8beedca49b5d38e04dca21741cb7df16688ae61ce4cb6341bd2c5035d61
+```
+
+**Windows (PowerShell):**
+```powershell
+Get-FileHash .\mkv-strip-windows-x64.exe -Algorithm SHA256
+# Expected: CE578C3987ACA8D42ABC3B00CF0A52538F944AC21889CAB6A1BEC0E3C8625E22
+```
+
+If the hash doesn't match, **do not run the binary** — re-download it from this repository.
+
+Full checksum reference: [`binaries/SHA256.md`](binaries/SHA256.md)
 
 ### List tracks
 
