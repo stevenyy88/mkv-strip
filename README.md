@@ -16,8 +16,10 @@ A tiny, fast, single-binary CLI tool written in pure Rust that reads and writes 
 
 | Command | Description |
 |---------|-------------|
+| `mkv-strip -l movie.mkv` | Inspect all tracks in an MKV (shorthand for `list`) |
 | `mkv-strip list` | Inspect all tracks in an MKV (type, language, codec, flags) |
 | `mkv-strip strip` | Remove audio/subtitle tracks by language or type |
+| `mkv-strip keep` | Keep only specified track IDs, strip the rest |
 | `mkv-strip extract` | Pull subtitle tracks out to `.srt` files |
 | `mkv-strip add` | Inject an `.srt` file as a new subtitle track |
 
@@ -34,7 +36,7 @@ Grab the latest binary from the [`binaries/`](binaries/) directory or build from
 
 | File | Platform | Size | SHA256 |
 |------|----------|------|--------|
-| [`binaries/mkv-strip-linux-x64`](binaries/mkv-strip-linux-x64) | Linux (x86-64) | ~1.8 MB | `229ef8beedca49b5d38e04dca21741cb7df16688ae61ce4cb6341bd2c5035d61` |
+| [`binaries/mkv-strip-linux-x64`](binaries/mkv-strip-linux-x64) | Linux (x86-64) | ~1.8 MB | `048f4d5fcf84e1db9bdf35601f087ff66e755faf0c3369f0f9f99d8d3a103227` |
 | [`binaries/mkv-strip-windows-x64.exe`](binaries/mkv-strip-windows-x64.exe) | Windows (x86-64) | ~2.2 MB | `ce578c3987aca8d42abc3b00cf0a52538f944ac21889cab6a1bec0e3c8625e22` |
 
 ### Verify Download Authenticity
@@ -44,7 +46,7 @@ After downloading, verify the SHA-256 checksum to confirm the file hasn't been t
 **Linux / macOS:**
 ```bash
 sha256sum mkv-strip-linux-x64
-# Expected: 229ef8beedca49b5d38e04dca21741cb7df16688ae61ce4cb6341bd2c5035d61
+# Expected: 048f4d5fcf84e1db9bdf35601f087ff66e755faf0c3369f0f9f99d8d3a103227
 ```
 
 **Windows (PowerShell):**
@@ -57,8 +59,14 @@ If the hash doesn't match, **do not run the binary** — re-download it from thi
 
 Full checksum reference: [`binaries/SHA256.md`](binaries/SHA256.md)
 
-### List tracks
+### List tracks (shorthand)
 
+```bash
+# Quick shorthand with -l
+mkv-strip -l movie.mkv
+```
+
+Or use the full command:
 ```bash
 mkv-strip list movie.mkv
 ```
@@ -72,7 +80,21 @@ mkv-strip list movie.mkv
   5 │ subtitle  │ spa  │ enabled          │      │ S_TEXT/UTF8
 ```
 
-### Strip tracks
+### Keep tracks by ID (shorthand)
+
+Use `-k` to keep only specific track IDs and strip the rest. Track IDs are the `#` numbers from `list`:
+
+```bash
+# Shorthand with -k
+mkv-strip -k 1,2,4 --keep-input movie.mkv --keep-output movie_stripped.mkv
+
+# Or use the full command
+mkv-strip keep -i movie.mkv -o movie_stripped.mkv --keep 1,2,4
+```
+
+This keeps only tracks #1, #2, and #4, and strips all others — useful for quickly trimming audio or subtitle tracks you don't need.
+
+### Strip tracks by language
 
 Keep only English and Japanese audio:
 ```bash
@@ -157,6 +179,7 @@ Image-based subtitles (VobSub `S_VOBSUB`, HDMV PGS) are not supported for extrac
 
 - **list / extract** — Uses `MatroskaView` to parse metadata without loading cluster data into memory
 - **strip** — Two-pass: metadata scan first, then full re-read with block-level track filtering
+- **keep** — Same two-pass approach as strip, but selects tracks by ID instead of language
 - **add** — Parses SRT timestamps, converts to MKV segment ticks, builds SimpleBlock elements, appends new TrackEntry + clusters
 
 ## ⚠️ Limitations
