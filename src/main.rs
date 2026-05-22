@@ -18,6 +18,20 @@ const TRACK_TYPE_VIDEO: u64 = 1;
 const TRACK_TYPE_AUDIO: u64 = 2;
 const TRACK_TYPE_SUBTITLE: u64 = 17;
 
+// EBML Element IDs for track flags (decoded VInt64 values, matching *Type::ID)
+// These are the VInt values with the marker bit stripped,
+// matching how mkv-element stores them internally.
+const EBML_ID_TRACK_ENTRY: u64 = 0x2E;       // TrackEntry: encoded 0xAE, decoded 0x2E
+const EBML_ID_FLAG_ENABLED: u64 = 0x39;       // FlagEnabled: encoded 0xB9, decoded 0x39
+const EBML_ID_FLAG_DEFAULT: u64 = 0x08;       // FlagDefault: encoded 0x88, decoded 0x08
+const EBML_ID_FLAG_FORCED: u64 = 0x15AA;      // FlagForced: encoded 0x55AA, decoded 0x15AA
+const EBML_ID_FLAG_HEARING_IMPAIRED: u64 = 0x15AB; // FlagHearingImpaired
+const EBML_ID_FLAG_VISUAL_IMPAIRED: u64 = 0x15AC;  // FlagVisualImpaired
+const EBML_ID_FLAG_TEXT_DESCRIPTIONS: u64 = 0x15AD; // FlagTextDescriptions
+const EBML_ID_FLAG_ORIGINAL: u64 = 0x15AE;    // FlagOriginal
+const EBML_ID_FLAG_COMMENTARY: u64 = 0x15AF;  // FlagCommentary
+const EBML_ID_TRACK_NUMBER: u64 = 0x57;       // TrackNumber: encoded 0xD7, decoded 0x57
+
 fn track_type_name(tt: u64) -> &'static str {
     match tt {
         TRACK_TYPE_VIDEO => "video",
@@ -49,15 +63,15 @@ fn parse_vint_value(data: &[u8]) -> Option<u64> {
     if data.len() < vint_len {
         return None;
     }
-    if vint_len == 1 {
-        Some((first & 0x7F) as u64)
-    } else {
-        let mut result: u64 = (first & (0xFF >> leading_zeros)) as u64;
-        for &b in &data[1..vint_len] {
-            result = (result << 8) | b as u64;
-        }
-        Some(result)
+    // Strip the marker bit: the marker is the first '1' bit from MSB.
+    // For a vint_len-byte VInt, the marker is bit (8 - vint_len) of the first byte.
+    // Mask to keep only the value bits.
+    let marker_mask = (1u8 << (8 - vint_len)) - 1; // e.g. vint_len=4 → 0x0F
+    let mut result: u64 = (first & marker_mask) as u64;
+    for &b in &data[1..vint_len] {
+        result = (result << 8) | b as u64;
     }
+    Some(result)
 }
 
 /// Extract the track number from a raw SimpleBlock or Block byte sequence.
@@ -538,6 +552,30 @@ enum Commands {
         #[arg(short = 'l', long = "lang", value_delimiter = ',')]
         languages: Vec<String>,
     },
+    /// Modify track flags in an MKV file in-place (no re-encode)
+    Flags {
+        /// Input MKV file (modified in-place)
+        #[arg(short, long)]
+        input: PathBuf,
+        /// Set tracks as default by ID (comma-separated)
+        #[arg(long = "set-default", value_delimiter = ',')]
+        set_default: Vec<u64>,
+        /// Clear default flag from tracks by ID (comma-separated)
+        #[arg(long = "clear-default", value_delimiter = ',')]
+        clear_default: Vec<u64>,
+        /// Set tracks as forced by ID (comma-separated)
+        #[arg(long = "set-forced", value_delimiter = ',')]
+        set_forced: Vec<u64>,
+        /// Clear forced flag from tracks by ID (comma-separated)
+        #[arg(long = "clear-forced", value_delimiter = ',')]
+        clear_forced: Vec<u64>,
+        /// Set tracks as enabled by ID (comma-separated)
+        #[arg(long = "set-enabled", value_delimiter = ',')]
+        set_enabled: Vec<u64>,
+        /// Clear enabled flag from tracks by ID (comma-separated)
+        #[arg(long = "clear-enabled", value_delimiter = ',')]
+        clear_enabled: Vec<u64>,
+    },
     /// Add an SRT subtitle file to an MKV file
     Add {
         /// Input MKV file
@@ -605,6 +643,328 @@ fn apply_flag_mods(tracks: &mut Tracks, set_default: &[u64], clear_default: &[u6
         if set_enabled_set.contains(&tn) { te.flag_enabled = FlagEnabled(1); }
         if clear_enabled_set.contains(&tn) { te.flag_enabled = FlagEnabled(0); }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Flags command — modify track flags in-place
+// ---------------------------------------------------------------------------
+
+/// A flag element found in the file with its byte position.
+#[allow(dead_code)]
+#[derive(Debug)]
+struct FlagLocation {
+    /// Byte offset of the flag element's ID in the file
+    id_offset: u64,
+    /// Byte offset of the flag element's data (after ID + size)
+    data_offset: u64,
+    /// Size of the data portion in bytes
+    data_size: u64,
+}
+
+/// Scan a single EBML element header (ID + size) from the current position.
+/// Returns (element_id, size_value, bytes_consumed).
+fn read_element_header_at(reader: &mut (impl Read + Seek), pos: u64) -> Result<(u64, u64, u64)> {
+    reader.seek(std::io::SeekFrom::Start(pos))?;
+    let mut id_buf = [0u8; 8];
+    reader.read_exact(&mut id_buf[..1])?;
+    let leading = id_buf[0].leading_zeros() as usize;
+    let id_len = if leading >= 8 { bail!("Invalid EBML ID at offset {}", pos); } else { leading + 1 };
+    if id_len > 1 {
+        reader.read_exact(&mut id_buf[1..id_len])?;
+    }
+    let element_id = parse_vint_value(&id_buf[..id_len])
+        .context("Failed to parse EBML element ID")?;
+
+    let size_start = pos + id_len as u64;
+    reader.seek(std::io::SeekFrom::Start(size_start))?;
+    let mut size_buf = [0u8; 8];
+    reader.read_exact(&mut size_buf[..1])?;
+    let size_leading = size_buf[0].leading_zeros() as usize;
+    let size_len = if size_leading >= 8 {
+        // Unknown size (all 1s)
+        return Ok((element_id, u64::MAX, (id_len + 1) as u64));
+    } else {
+        size_leading + 1
+    };
+    if size_len > 1 {
+        reader.seek(std::io::SeekFrom::Start(size_start))?;
+        reader.read_exact(&mut size_buf[..size_len])?;
+    }
+    let raw_size = parse_vint_value(&size_buf[..size_len]).unwrap_or(0);
+
+    let header_len = (id_len + size_len) as u64;
+    Ok((element_id, raw_size, header_len))
+}
+
+/// Find all flag elements within a TrackEntry that starts at `te_start` with `te_size` bytes.
+/// Returns a map of EBML flag element ID -> FlagLocation.
+fn find_flags_in_track_entry(
+    reader: &mut (impl Read + Seek),
+    te_start: u64,
+    te_header_len: u64,
+    te_size: u64,
+) -> Result<(u64, std::collections::HashMap<u64, FlagLocation>)> {
+    let te_data_start = te_start + te_header_len;
+    let te_end = te_data_start + te_size;
+    let mut track_number: u64 = 0;
+    let mut flags = std::collections::HashMap::new();
+
+    let mut pos = te_data_start;
+    while pos < te_end {
+        let (elem_id, elem_size, header_len) = read_element_header_at(reader, pos)?;
+        let data_offset = pos + header_len;
+
+        if elem_id == EBML_ID_TRACK_NUMBER {
+            // Read the track number as a big-endian unsigned integer (NOT VInt)
+            reader.seek(std::io::SeekFrom::Start(data_offset))?;
+            let mut tn_buf = [0u8; 8];
+            let read_len = elem_size.min(8) as usize;
+            reader.read_exact(&mut tn_buf[..read_len])?;
+            track_number = u64::from_be_bytes(tn_buf) >> (8 * (8 - read_len));
+        } else if matches!(elem_id,
+            EBML_ID_FLAG_ENABLED | EBML_ID_FLAG_DEFAULT | EBML_ID_FLAG_FORCED |
+            EBML_ID_FLAG_HEARING_IMPAIRED | EBML_ID_FLAG_VISUAL_IMPAIRED |
+            EBML_ID_FLAG_TEXT_DESCRIPTIONS | EBML_ID_FLAG_ORIGINAL | EBML_ID_FLAG_COMMENTARY
+        ) {
+            flags.insert(elem_id, FlagLocation {
+                id_offset: pos,
+                data_offset,
+                data_size: elem_size,
+            });
+        }
+
+        if elem_size == u64::MAX { break; }
+        pos = data_offset + elem_size;
+    }
+
+    Ok((track_number, flags))
+}
+
+/// An in-place flag modification request.
+struct FlagMod {
+    flag_id: u64,
+    value: u8,
+}
+
+fn cmd_flags(
+    input: &PathBuf,
+    set_default: &[u64],
+    clear_default: &[u64],
+    set_forced: &[u64],
+    clear_forced: &[u64],
+    set_enabled: &[u64],
+    clear_enabled: &[u64],
+) -> Result<()> {
+    // Build a map of track_number -> list of flag modifications
+    let mut mods: std::collections::HashMap<u64, Vec<FlagMod>> = std::collections::HashMap::new();
+
+    for &id in set_default   { mods.entry(id).or_default().push(FlagMod { flag_id: EBML_ID_FLAG_DEFAULT,   value: 1 }); }
+    for &id in clear_default { mods.entry(id).or_default().push(FlagMod { flag_id: EBML_ID_FLAG_DEFAULT,   value: 0 }); }
+    for &id in set_forced   { mods.entry(id).or_default().push(FlagMod { flag_id: EBML_ID_FLAG_FORCED,    value: 1 }); }
+    for &id in clear_forced { mods.entry(id).or_default().push(FlagMod { flag_id: EBML_ID_FLAG_FORCED,    value: 0 }); }
+    for &id in set_enabled   { mods.entry(id).or_default().push(FlagMod { flag_id: EBML_ID_FLAG_ENABLED,   value: 1 }); }
+    for &id in clear_enabled { mods.entry(id).or_default().push(FlagMod { flag_id: EBML_ID_FLAG_ENABLED,   value: 0 }); }
+
+    if mods.is_empty() {
+        bail!("No flag modifications specified. Use --set-default, --clear-default, --set-forced, --clear-forced, --set-enabled, or --clear-enabled.");
+    }
+
+    // Validate track IDs exist using MatroskaView
+    let mut reader = BufReader::new(File::open(input)?);
+    let view = MatroskaView::new(&mut reader)
+        .with_context(|| format!("Failed to parse MKV metadata from {}", input.display()))?;
+    if view.segments.len() != 1 {
+        bail!("Multi-segment files are not yet supported.");
+    }
+    let tracks = view.segments[0].tracks.as_ref().context("No Tracks element found")?;
+    let valid_ids: HashSet<u64> = tracks.track_entry.iter().map(|te| *te.track_number).collect();
+    for &id in mods.keys() {
+        if !valid_ids.contains(&id) {
+            bail!("Track ID {} not found in the MKV file. Use 'mkv-strip list' to see available tracks.", id);
+        }
+    }
+    drop(view);
+    drop(reader);
+
+    // Now scan the raw file to find TrackEntry elements and their flags
+    // We use the full-read approach since we need to find exact byte positions
+    let mut reader = BufReader::new(File::open(input)?);
+    let file_size = reader.seek(std::io::SeekFrom::End(0))?;
+    reader.seek(std::io::SeekFrom::Start(0))?;
+
+    // Parse EBML header to find where Segment starts
+    let _ebml = Ebml::read_from(&mut reader)?;
+    let seg_header = Header::read_from(&mut reader)?;
+    if seg_header.id != Segment::ID {
+        bail!("Expected Segment element");
+    }
+    let seg_data_start = reader.stream_position()?;
+    let seg_size = if *seg_header.size == u64::MAX { file_size - seg_data_start } else { *seg_header.size };
+    let seg_end = seg_data_start + seg_size;
+
+    // Scan for the Tracks element within the Segment
+    let mut tracks_pos: Option<(u64, u64, u64)> = None; // (start, header_len, size)
+    let mut pos = seg_data_start;
+    while pos < seg_end {
+        let (elem_id, elem_size, header_len) = read_element_header_at(&mut reader, pos)?;
+        if elem_id == *Tracks::ID {
+            tracks_pos = Some((pos, header_len, elem_size));
+            break;
+        }
+        if elem_size == u64::MAX { break; }
+        pos += header_len + elem_size;
+    }
+    let (tracks_start, tracks_header_len, tracks_size) = tracks_pos
+        .context("No Tracks element found in MKV file")?;
+    let tracks_data_start = tracks_start + tracks_header_len;
+    let tracks_end = tracks_data_start + tracks_size;
+
+    // Find TrackEntry elements and their flags
+    let mut modifications: Vec<(u64, u8)> = Vec::new(); // (data_offset, new_value)
+    let mut modified_tracks: HashSet<u64> = HashSet::new();
+    let mut needs_insertion = false;
+
+    let mut te_pos = tracks_data_start;
+    while te_pos < tracks_end {
+        let (te_id, te_size, te_header_len) = read_element_header_at(&mut reader, te_pos)?;
+        if te_id != EBML_ID_TRACK_ENTRY {
+            if te_size == u64::MAX { break; }
+            te_pos += te_header_len + te_size;
+            continue;
+        }
+        let te_data_start = te_pos + te_header_len;
+        let te_end = te_data_start + te_size;
+
+        let (track_number, found_flags) = find_flags_in_track_entry(&mut reader, te_pos, te_header_len, te_size)?;
+
+        if let Some(track_mods) = mods.get(&track_number) {
+            for fm in track_mods {
+                if let Some(loc) = found_flags.get(&fm.flag_id) {
+                    // Flag element exists — we can overwrite in-place
+                    if loc.data_size != 1 {
+                        // Safety check: flag data should be 1 byte (0 or 1)
+                        // If it's larger, we can still write but need to be careful
+                        // For safety, only in-place modify if size is 1
+                        needs_insertion = true;
+                        break;
+                    }
+                    modifications.push((loc.data_offset, fm.value));
+                    modified_tracks.insert(track_number);
+                } else {
+                    // Flag element doesn't exist — need insertion (requires rewrite)
+                    needs_insertion = true;
+                }
+            }
+        }
+
+        if te_size == u64::MAX { break; }
+        te_pos = te_end;
+    }
+
+    if needs_insertion {
+        // Some flags don't exist yet — fall back to full rewrite
+        drop(reader);
+        return cmd_flags_rewrite(input, mods);
+    }
+
+    // All flags exist and are 1-byte — do in-place modification
+    drop(reader);
+    let mut file = std::fs::OpenOptions::new().write(true).open(input)?;
+    for (data_offset, new_value) in &modifications {
+        file.seek(std::io::SeekFrom::Start(*data_offset))?;
+        file.write_all(&[*new_value])?;
+    }
+    file.flush()?;
+    drop(file);
+
+    // Show the result
+    let mut reader = BufReader::new(File::open(input)?);
+    let view2 = MatroskaView::new(&mut reader)?;
+    let tracks2 = view2.segments[0].tracks.as_ref().unwrap();
+    let infos: Vec<TrackInfo> = tracks2.track_entry.iter()
+        .map(|te| TrackInfo::from_track_entry(te))
+        .collect();
+
+    println!();
+    let table = TrackTable::build(&infos);
+    println!("  {}", table.header_line().trim_start());
+    println!("  {}", table.separator_line().trim_start());
+    for row in &table.rows {
+        println!("  {}", table.row_line(row).trim_start());
+    }
+    println!();
+    let mod_names: Vec<String> = modified_tracks.iter().map(|t| format!("#{}", t)).collect();
+    println!("✓ Modified flags in-place for track(s): {}", mod_names.join(", "));
+
+    Ok(())
+}
+
+/// Fallback: full rewrite when flag elements need to be inserted.
+fn cmd_flags_rewrite(
+    input: &PathBuf,
+    mods: std::collections::HashMap<u64, Vec<FlagMod>>,
+) -> Result<()> {
+    let mut mkv_data = read_full_mkv(input)?;
+    let tracks = mkv_data.tracks.as_mut().context("No Tracks element")?;
+
+    let mut modified_tracks: HashSet<u64> = HashSet::new();
+    for te in &mut tracks.track_entry {
+        let tn = *te.track_number;
+        if let Some(track_mods) = mods.get(&tn) {
+            for fm in track_mods {
+                match fm.flag_id {
+                    EBML_ID_FLAG_DEFAULT   => te.flag_default = FlagDefault(fm.value as u64),
+                    EBML_ID_FLAG_FORCED    => te.flag_forced = FlagForced(fm.value as u64),
+                    EBML_ID_FLAG_ENABLED   => te.flag_enabled = FlagEnabled(fm.value as u64),
+                    EBML_ID_FLAG_HEARING_IMPAIRED => {
+                        te.flag_hearing_impaired = if fm.value == 1 { Some(FlagHearingImpaired(1)) } else { Some(FlagHearingImpaired(0)) };
+                    }
+                    EBML_ID_FLAG_VISUAL_IMPAIRED => {
+                        te.flag_visual_impaired = if fm.value == 1 { Some(FlagVisualImpaired(1)) } else { Some(FlagVisualImpaired(0)) };
+                    }
+                    EBML_ID_FLAG_TEXT_DESCRIPTIONS => {
+                        te.flag_text_descriptions = if fm.value == 1 { Some(FlagTextDescriptions(1)) } else { Some(FlagTextDescriptions(0)) };
+                    }
+                    EBML_ID_FLAG_ORIGINAL => {
+                        te.flag_original = if fm.value == 1 { Some(FlagOriginal(1)) } else { Some(FlagOriginal(0)) };
+                    }
+                    EBML_ID_FLAG_COMMENTARY => {
+                        te.flag_commentary = if fm.value == 1 { Some(FlagCommentary(1)) } else { Some(FlagCommentary(0)) };
+                    }
+                    _ => {}
+                }
+                modified_tracks.insert(tn);
+            }
+        }
+    }
+
+    // Write to a temp file, then replace original
+    let tmp_path = input.with_extension("mkv-strip-tmp");
+    write_mkv(&tmp_path, &mkv_data)?;
+    std::fs::rename(&tmp_path, input)
+        .with_context(|| format!("Failed to replace {} with modified file", input.display()))?;
+
+    // Show the result
+    let mut reader = BufReader::new(File::open(input)?);
+    let view = MatroskaView::new(&mut reader)?;
+    let tracks2 = view.segments[0].tracks.as_ref().unwrap();
+    let infos: Vec<TrackInfo> = tracks2.track_entry.iter()
+        .map(|te| TrackInfo::from_track_entry(te))
+        .collect();
+
+    println!();
+    let table = TrackTable::build(&infos);
+    println!("  {}", table.header_line().trim_start());
+    println!("  {}", table.separator_line().trim_start());
+    for row in &table.rows {
+        println!("  {}", table.row_line(row).trim_start());
+    }
+    println!();
+    let mod_names: Vec<String> = modified_tracks.iter().map(|t| format!("#{}", t)).collect();
+    println!("✓ Modified flags for track(s): {}", mod_names.join(", "));
+    println!("  (flags were rewritten — file structure updated)");
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1468,6 +1828,8 @@ fn main() -> Result<()> {
             &set_default, &clear_default, &set_forced, &clear_forced, &set_enabled, &clear_enabled),
         Some(Commands::Extract { input, output_dir, track_numbers, languages }) =>
             cmd_extract(&input, &output_dir, &track_numbers, &languages),
+        Some(Commands::Flags { input, set_default, clear_default, set_forced, clear_forced, set_enabled, clear_enabled }) =>
+            cmd_flags(&input, &set_default, &clear_default, &set_forced, &clear_forced, &set_enabled, &clear_enabled),
         Some(Commands::Add { input, srt, output, lang, lang_bcp47, name, default, forced, hearing_impaired, visual_impaired, descriptions, original, commentary }) =>
             cmd_add(&input, &srt, &output, &lang, &lang_bcp47, &name, default, forced, hearing_impaired, visual_impaired, descriptions, original, commentary),
         None => {
