@@ -18,6 +18,7 @@ A tiny, fast, single-binary CLI tool written in pure Rust that reads and writes 
 |---------|-------------|
 | `mkv-strip -l movie.mkv` | Inspect all tracks (shorthand for `list`) |
 | `mkv-strip list` | Inspect all tracks in an MKV (type, language, codec, flags) |
+| `mkv-strip flags -i movie.mkv --set-forced 3` | **Modify track flags in-place** (no output file needed) |
 | `mkv-strip strip -k 1,2,4` | Keep only specified track IDs, strip the rest |
 | `mkv-strip strip --set-forced 3` | Modify track flags (default, forced, enabled) |
 | `mkv-strip strip` | Remove audio/subtitle tracks by language or type |
@@ -38,8 +39,8 @@ Grab the latest binary from the [`binaries/`](binaries/) directory or build from
 
 | File | Platform | Size | SHA256 |
 |------|----------|------|--------|
-| [`binaries/mkv-strip-linux-x64`](binaries/mkv-strip-linux-x64) | Linux (x86-64) | ~1.8 MB | `1c773f899cb191f145eb625ecf8d6ee6e71eb10158358d26f485bf8acd815c98` |
-| [`binaries/mkv-strip-windows-x64.exe`](binaries/mkv-strip-windows-x64.exe) | Windows (x86-64) | ~2.2 MB | `a5c043741a03937802b554409a59207f4ccb0e7d90a66aa11d556f3cb4eb6971` |
+| [`binaries/mkv-strip-linux-x64`](binaries/mkv-strip-linux-x64) | Linux (x86-64) | ~1.9 MB | `f92555cfde4ac30c220775ee379dd82a4f386a2ac4cd35f9fd274db1c2833025` |
+| [`binaries/mkv-strip-windows-x64.exe`](binaries/mkv-strip-windows-x64.exe) | Windows (x86-64) | ~2.3 MB | `aab98bdaa01f4a1da0ee4f00c0d6b793b5050f29c440bdbe3ac43a7eef0d0789` |
 
 ### Verify Download Authenticity
 
@@ -48,13 +49,13 @@ After downloading, verify the SHA-256 checksum to confirm the file hasn't been t
 **Linux / macOS:**
 ```bash
 sha256sum mkv-strip-linux-x64
-# Expected: 1c773f899cb191f145eb625ecf8d6ee6e71eb10158358d26f485bf8acd815c98
+# Expected: f92555cfde4ac30c220775ee379dd82a4f386a2ac4cd35f9fd274db1c2833025
 ```
 
 **Windows (PowerShell):**
 ```powershell
 Get-FileHash .\mkv-strip-windows-x64.exe -Algorithm SHA256
-# Expected: A5C043741A03937802B554409A59207F4CCB0E7D90A66AA11D556F3CB4EB6971
+# Expected: AAB98BDAA01F4A1DA0EE4F00C0D6B793B5050F29C440BDBE3AC43A7EEF0D0789
 ```
 
 If the hash doesn't match, **do not run the binary** — re-download it from this repository.
@@ -119,6 +120,36 @@ Available flag options:
 | `--clear-enabled <ids>` | Disable tracks |
 
 > **Note:** Track flags can also be combined with `--keep`, `--no-audio`, etc.
+
+### Modify track flags in-place
+
+Use the `flags` command to modify track flags **directly on the original file** — no output file needed, no re-encoding, instant:
+
+```bash
+# Set subtitle track 4 as forced
+mkv-strip flags -i movie.mkv --set-forced 4
+
+# Clear default flag from audio track 2 and set it on track 3
+mkv-strip flags -i movie.mkv --clear-default 2 --set-default 3
+
+# Disable a track without removing it
+mkv-strip flags -i movie.mkv --clear-enabled 5
+
+# Multiple operations at once
+mkv-strip flags -i movie.mkv --set-default 3 --set-forced 4 --clear-default 2
+```
+
+Available options (same as `strip` flags):
+| Option | Description |
+|---------------------|
+| `--set-default <ids>` | Set tracks as default |
+| `--clear-default <ids>` | Clear default flag from tracks |
+| `--set-forced <ids>` | Set tracks as forced |
+| `--clear-forced <ids>` | Clear forced flag from tracks |
+| `--set-enabled <ids>` | Enable tracks |
+| `--clear-enabled <ids>` | Disable tracks |
+
+> **How it works:** The `flags` command modifies the file in-place by overwriting only the flag bytes in the EBML structure. Since flag values are fixed-size integers (0 or 1), this is instant and doesn't require re-encoding or creating a new file. If a flag element doesn't exist yet, it falls back to a full rewrite (still replaces the original file).
 
 ### Strip tracks by language
 
@@ -221,6 +252,7 @@ Image-based subtitles (VobSub `S_VOBSUB`, HDMV PGS) are not supported for extrac
 ## ⚙️ How It Works
 
 - **list / extract** — Uses `MatroskaView` to parse metadata without loading cluster data into memory
+- **flags** — Modifies flag bytes in-place by locating EBML element positions and overwriting only the value bytes (instant, no re-encode); falls back to full rewrite if a flag element needs to be inserted
 - **strip** — Two-pass: metadata scan first, then full re-read with block-level track filtering; can also modify track flags (default, forced, enabled)
 - **strip -k** — Same two-pass approach, but selects tracks by ID instead of language
 - **add** — Parses SRT timestamps, converts to MKV segment ticks, builds SimpleBlock elements, appends new TrackEntry + clusters

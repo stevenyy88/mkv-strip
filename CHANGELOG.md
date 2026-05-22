@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.3] - 2026-05-23
+
+### Added
+
+- **`flags` command** — modify track flags in-place on the original MKV file without creating a new file
+  - `mkv-strip flags -i movie.mkv --set-forced 3 --clear-default 2`
+  - Options: `--set-default`, `--clear-default`, `--set-forced`, `--clear-forced`, `--set-enabled`, `--clear-enabled`
+  - All options accept comma-separated track IDs
+  - Modifies the file in-place by overwriting only the flag bytes (no re-encode, instant)
+  - Falls back to full rewrite if a flag element doesn't exist yet in the file
+
 ## [0.2.2] - 2026-05-22
 
 ### Added
