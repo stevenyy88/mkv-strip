@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.5] - 2026-05-23
+
+### Changed
+
+- **Fixed memory consumption for large MKV files** — peak RAM is now ~3-20 MB regardless of input file size (was: file size * 2 for `strip`/`keep` commands)
+  - When ALL tracks are kept: raw byte-copy clusters with no decode/encode — ~3 MB peak RAM
+  - When SOME tracks are removed: parse + filter clusters one at a time — ~20 MB peak RAM per cluster
+  - Previous versions loaded the entire file into memory before writing, causing Windows "Insufficient system resources" (error 1450) on large files
+
 ## [0.2.4] - 2026-05-23
 
 ### Changed

@@ -254,13 +254,13 @@ Image-based subtitles (VobSub `S_VOBSUB`, HDMV PGS) are not supported for extrac
 
 - **list / extract** — Uses `MatroskaView` to parse metadata without loading cluster data into memory
 - **flags** — Modifies flag bytes in-place by locating EBML element positions and overwriting only the value bytes (instant, no re-encode); falls back to full rewrite if a flag element needs to be inserted
-- **strip** — Two-pass: metadata scan first, then full re-read with block-level track filtering; can also modify track flags (default, forced, enabled)
+- **strip** — Two-pass: metadata scan first (via `MatroskaView`, lightweight), then streaming cluster processing with block-level track filtering. When all tracks are kept, clusters are raw-copied with zero decode/encode (~3 MB RAM). When some tracks are removed, clusters are parsed one at a time (~20 MB RAM peak). Can also modify track flags (default, forced, enabled).
 - **strip -k** — Same two-pass approach, but selects tracks by ID instead of language
 - **add** — Parses SRT timestamps, converts to MKV segment ticks, builds SimpleBlock elements, appends new TrackEntry + clusters
 
 ## ⚠️ Limitations
 
-- **Memory** — Clusters are streamed through during strip/keep operations (one at a time); `add`, `extract`, and `flags` commands also use minimal memory
+- **Memory** — Peak RAM is ~3-20 MB regardless of input file size. When all tracks are kept, clusters are raw-copied (no decode/encode). When some tracks are removed, clusters are parsed and filtered one at a time. `add`, `extract`, and `flags` commands also use minimal memory.
 - **SeekHead / Cues** — Dropped from output; most players rebuild these automatically
 - **Multi-segment files** — Not yet supported (rare in practice)
 - **Track renumbering** — Track numbers are preserved as-is

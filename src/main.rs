@@ -2,13 +2,13 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, CommandFactory};
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Seek, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use bytes::Bytes;
 use mkv_element::io::blocking_impl::{ReadElement, ReadFrom, WriteTo};
 use mkv_element::prelude::*;
-use mkv_element::view::MatroskaView;
+use mkv_element::view::{MatroskaView, SegmentView};
 use mkv_element::ClusterBlock;
 
 // ---------------------------------------------------------------------------
@@ -458,14 +458,10 @@ fn write_mkv(output: &PathBuf, data: &MkvFullData) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Streaming write — writes segment children one at a time to limit memory
+// Streaming I/O helpers for memory-efficient processing
 // ---------------------------------------------------------------------------
 
-/// Write the EBML header and a Segment element with unknown size,
-/// then write each child element individually.
-/// This avoids buffering the entire output file in memory.
 /// Encode a u64 value as an EBML VInt with the minimum number of bytes.
-/// Returns the encoded bytes including the marker bit.
 fn encode_vint_size(value: u64) -> Vec<u8> {
     if value <= 0x7F {
         vec![(0x80 | (value & 0x7F)) as u8]
@@ -486,96 +482,174 @@ fn encode_vint_size(value: u64) -> Vec<u8> {
     }
 }
 
-/// Write an MKV file in streaming fashion, writing one cluster at a time to limit memory usage.
-/// The Segment header is written with a placeholder size, which is patched after all content is written.
-fn write_segment_streaming<W: Write + Seek>(
-    writer: &mut W,
-    ebml: &Ebml,
-    info: &Info,
-    tracks: &Option<Tracks>,
-    clusters: &mut dyn Iterator<Item = Cluster>,
-    tags: &[Tags],
-    attachments: &Option<Attachments>,
-    chapters: &Option<Chapters>,
-) -> Result<()> {
-    // Write EBML header
-    ebml.write_to(writer)?;
+/// Raw-copy exactly `n` bytes from reader to writer using a 64KB buffer.
+/// This avoids allocating a buffer proportional to `n`.
+fn copy_n_bytes<R: Read + ?Sized, W: Write + ?Sized>(r: &mut R, w: &mut W, mut n: u64) -> Result<()> {
+    let mut buf = [0u8; 65536];
+    while n > 0 {
+        let to_read = n.min(buf.len() as u64) as usize;
+        r.read_exact(&mut buf[..to_read])?;
+        w.write_all(&mut buf[..to_read])?;
+        n -= to_read as u64;
+    }
+    Ok(())
+}
 
-    // Write Segment header with placeholder size.
-    // Reserve 8 bytes for the size VInt (supports sizes up to 2^56 ≈ 72 PB).
-    // Segment ID: 4 bytes (0x18538067)
+/// Write an EBML Void element to fill `gap` bytes.
+fn write_void_fill<W: Write + ?Sized>(w: &mut W, gap: usize) -> Result<()> {
+    if gap == 0 { return Ok(()); }
+    if gap == 2 {
+        w.write_all(&[0xEC, 0x80])?;
+    } else if gap > 2 {
+        // Void element: 0xEC (1 byte) + size VInt + zero padding
+        // We need: 1 + size_vint_len + content_len = gap
+        // Start with content_len = gap - 2 (assuming 1-byte size VInt)
+        // If content_len > 127, we need 2-byte size VInt, so content_len = gap - 3
+        let (size_vint, content_len) = if gap - 2 <= 127 {
+            (encode_vint_size((gap - 2) as u64), gap - 2)
+        } else {
+            (encode_vint_size((gap - 3) as u64), gap - 3)
+        };
+        w.write_all(&[0xEC])?;
+        w.write_all(&size_vint)?;
+        for _ in 0..content_len {
+            w.write_all(&[0x00])?;
+        }
+    }
+    // gap == 1 is impossible to fill with valid EBML; just write a zero byte
+    Ok(())
+}
+
+/// Stream an MKV file with track filtering, using constant memory regardless of file size.
+/// Phase 1: Read metadata (tracks, tags, etc.) via MatroskaView — lightweight, no clusters.
+/// Phase 2: For each cluster in the input:
+///   - If ALL tracks are kept: raw-copy the entire cluster (no decode/encode needed)
+///   - If SOME tracks are removed: parse cluster children, write only kept blocks
+/// Phase 3: Write Tags, patch Segment size.
+fn stream_mkv_with_filter<R: Read + Seek, W: Write + Seek>(
+    reader: &mut R,
+    writer: &mut W,
+    seg_view: &SegmentView,
+    kept_track_numbers: &HashSet<u64>,
+    filtered_tracks: &Option<Tracks>,
+    filtered_tags: &[Tags],
+    filtered_attachments: &Option<Attachments>,
+    filtered_chapters: &Option<Chapters>,
+) -> Result<u64> {
+    let all_tracks_kept = seg_view.tracks.as_ref()
+        .map(|t| t.track_entry.iter().all(|te| kept_track_numbers.contains(&(*te.track_number).into())))
+        .unwrap_or(true);
+
+    // Read EBML header
+    let ebml = Ebml::read_from(reader)?;
+    let segment_header = Header::read_from(reader)?;
+    if segment_header.id != Segment::ID {
+        bail!("Expected Segment element, got {}", segment_header.id);
+    }
+    let segment_data_start = reader.stream_position()?;
+
+    // Write EBML header + Segment header with placeholder size
+    ebml.write_to(writer)?;
     writer.write_all(&[0x18, 0x53, 0x80, 0x67])?; // Segment ID
     let size_offset = writer.stream_position()?;
-    // Write 8-byte placeholder (unknown size = 0x01 FF FF FF FF FF FF FF)
-    writer.write_all(&[0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])?;
+    writer.write_all(&[0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])?; // 8-byte placeholder
     let content_start = writer.stream_position()?;
 
-    // Write metadata elements
-    info.write_to(writer)?;
-    if let Some(tracks) = tracks {
+    // Write metadata
+    seg_view.info.write_to(writer)?;
+    if let Some(ref tracks) = filtered_tracks {
         tracks.write_to(writer)?;
     }
-    if let Some(attachments) = attachments {
+    if let Some(ref attachments) = filtered_attachments {
         attachments.write_to(writer)?;
     }
-    if let Some(chapters) = chapters {
+    if let Some(ref chapters) = filtered_chapters {
         chapters.write_to(writer)?;
     }
 
-    // Stream clusters — only one in memory at a time
-    while let Some(cluster) = clusters.next() {
-        cluster.write_to(writer)?;
-    }
+    // Stream clusters
+    let segment_size = if segment_header.size.is_unknown { u64::MAX } else { *segment_header.size };
+    let segment_end = if segment_size == u64::MAX { u64::MAX } else { segment_data_start + segment_size };
 
-    // Write Tags
-    for tag in tags.iter() {
-        tag.write_to(writer)?;
-    }
+    reader.seek(SeekFrom::Start(segment_data_start))?;
+    let mut cluster_count: u64 = 0;
 
-    // Patch the Segment size
-    let content_end = writer.stream_position()?;
-    let content_size = content_end - content_start;
-    let size_bytes = encode_vint_size(content_size);
+    loop {
+        let pos = reader.stream_position()?;
+        if pos >= segment_end { break; }
+        let Ok(child_header) = Header::read_from(reader) else { break; };
+        let header_len = reader.stream_position()? - pos;
 
-    // Write the actual size at the reserved offset
-    writer.seek(std::io::SeekFrom::Start(size_offset))?;
-    writer.write_all(&size_bytes)?;
+        match child_header.id {
+            Cluster::ID => {
+                if all_tracks_kept {
+                    // ALL tracks kept — raw copy the entire cluster (header + body)
+                    // No decode/encode needed — zero extra memory
+                    reader.seek(SeekFrom::Start(pos))?;
+                    copy_n_bytes(reader, writer, header_len + *child_header.size)?;
+                    cluster_count += 1;
+                } else {
+                    // Some tracks removed — need to filter blocks within the cluster
+                    // Parse the cluster body to find block elements
+                    let _cluster_body_start = reader.stream_position()?;
+                    let _cluster_body_size = *child_header.size;
 
-    // If size_bytes is shorter than 8 bytes, fill the gap with a Void element
-    let gap = 8 - size_bytes.len();
-    if gap > 0 {
-        // Use an EBML Void element (ID 0xEC) to fill the gap
-        // Void element: ID (1 byte 0xEC) + size + content of zeros
-        let void_content_size = gap - 2; // 2 bytes for Void element header minimum
-        if void_content_size > 0 {
-            writer.write_all(&[0xEC])?;
-            let void_size_vint = encode_vint_size(void_content_size as u64);
-            writer.write_all(&void_size_vint)?;
-            // The gap calculation accounts for: size_bytes + 0xEC + void_size_vint + void_content
-            // But we need to be precise about the total gap fill
-            // Total bytes after size_bytes: gap = 8 - size_bytes.len()
-            // We write: 0xEC (1 byte) + void_size_vint (? bytes) + void zeros (? bytes)
-            // We need: 1 + void_size_vint.len() + void_content_size = gap
-            // But void_content_size = gap - 1 - void_size_vint.len()
-            // So: 1 + void_size_vint.len() + (gap - 1 - void_size_vint.len()) = gap ✓
-            for _ in 0..void_content_size {
-                writer.write_all(&[0x00])?;
+                    // Write the cluster header (ID + size) first
+                    // We need to re-encode the cluster with the filtered body size,
+                    // but we don't know the filtered size yet.
+                    // Strategy: buffer the filtered cluster body, measure its size, then write.
+                    // For large clusters with only a few blocks removed, this is suboptimal,
+                    // but it's correct and memory use is bounded by the filtered body size.
+                    //
+                    // Better strategy: write cluster header with unknown size,
+                    // stream filtered children, then go back and patch.
+                    // But that requires another seek-back which complicates things.
+                    //
+                    // Simplest correct approach: use Cluster::read_element for filtered clusters,
+                    // but this loads the entire cluster body. However, individual clusters in
+                    // real MKV files are typically < 32MB, so this is acceptable.
+                    // The key improvement is: when ALL tracks are kept (the common case),
+                    // we raw-copy with zero memory.
+                    let mut cluster = Cluster::read_element(&child_header, reader)?;
+                    let _original_blocks = cluster.blocks.len();
+                    cluster.blocks.retain(|block| match block {
+                        ClusterBlock::Simple(sb) => block_matches_kept_track(sb, kept_track_numbers),
+                        ClusterBlock::Group(bg) => block_matches_kept_track(&bg.block, kept_track_numbers),
+                    });
+                    if !cluster.blocks.is_empty() {
+                        cluster.write_to(writer)?;
+                        cluster_count += 1;
+                    }
+                }
             }
-        } else {
-            // void_content_size <= 0 means gap is 1 or 2
-            // For gap=2: write 0xEC 0x80 (Void element with size 0)
-            if gap == 2 {
-                writer.write_all(&[0xEC, 0x80])?;
+            _ => {
+                // Non-cluster element (Tags, Cues, etc.) — skip it
+                // We already have metadata from MatroskaView and write our own Tags at the end
+                copy_n_bytes(reader, &mut std::io::sink(), *child_header.size)?;
             }
-            // gap=1 is impossible for valid MKV; shouldn't happen with 8-byte reserve
         }
     }
 
-    // Seek to end to ensure proper file state
-    writer.seek(std::io::SeekFrom::End(0))?;
+    // Write Tags
+    for tag in filtered_tags.iter() {
+        tag.write_to(writer)?;
+    }
+
+    // Patch Segment size
+    let content_end = writer.stream_position()?;
+    let content_size = content_end - content_start;
+    let size_bytes = encode_vint_size(content_size);
+    writer.seek(SeekFrom::Start(size_offset))?;
+    writer.write_all(&size_bytes)?;
+    let gap = 8 - size_bytes.len();
+    write_void_fill(writer, gap)?;
+
+    writer.seek(SeekFrom::End(0))?;
     writer.flush()?;
-    Ok(())
+
+    Ok(cluster_count)
 }
+
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -1162,6 +1236,7 @@ fn cmd_strip(
         bail!("Cannot use --no-subtitle with --remove-subtitle");
     }
 
+    // Phase 1: Read metadata using MatroskaView (lightweight — no clusters loaded)
     let mut reader = BufReader::new(File::open(input)?);
     let view = MatroskaView::new(&mut reader)
         .with_context(|| format!("Failed to parse MKV metadata from {}", input.display()))?;
@@ -1258,15 +1333,7 @@ fn cmd_strip(
         println!("  {}{}", pad_right("STRIP", label_w), table.row_line(row).trim_start());
     }
 
-    // Phase 3: Re-read and reconstruct
-    let mut full_reader = BufReader::new(File::open(input)?);
-    let ebml = Ebml::read_from(&mut full_reader)?;
-    let segment_header = Header::read_from(&mut full_reader)?;
-    if segment_header.id != Segment::ID {
-        bail!("Expected Segment element, got {}", segment_header.id);
-    }
-    let segment_data_start = full_reader.stream_position()?;
-
+    // Phase 2: Prepare filtered metadata
     let removed_track_uids: HashSet<u64> = tracks
         .track_entry
         .iter()
@@ -1274,70 +1341,34 @@ fn cmd_strip(
         .map(|te| *te.track_uid)
         .collect();
 
-    full_reader.seek(std::io::SeekFrom::Start(segment_data_start))?;
-
-    let mut filtered_tracks: Option<Tracks> = None;
-    let mut filtered_clusters: Vec<Cluster> = Vec::new();
-    let mut filtered_tags: Vec<Tags> = Vec::new();
-    let mut info: Option<Info> = None;
-    let mut attachments: Option<Attachments> = None;
-    let mut chapters: Option<Chapters> = None;
-
-    let segment_size = if segment_header.size.is_unknown { u64::MAX } else { *segment_header.size };
-    let segment_end = if segment_size == u64::MAX { u64::MAX } else { segment_data_start + segment_size };
-
-    loop {
-        let pos = full_reader.stream_position()?;
-        if pos >= segment_end { break; }
-        let Ok(child_header) = Header::read_from(&mut full_reader) else { break; };
-
-        match child_header.id {
-            Tracks::ID => {
-                let mut tracks_data = Tracks::read_element(&child_header, &mut full_reader)?;
-                tracks_data.track_entry.retain(|te| kept_track_numbers.contains(&(*te.track_number).into()));
-                apply_flag_mods(&mut tracks_data, set_default, clear_default, set_forced, clear_forced, set_enabled, clear_enabled);
-                filtered_tracks = Some(tracks_data);
-            }
-            Cluster::ID => {
-                let mut cluster = Cluster::read_element(&child_header, &mut full_reader)?;
-                cluster.blocks.retain(|block| match block {
-                    ClusterBlock::Simple(sb) => block_matches_kept_track(sb, &kept_track_numbers),
-                    ClusterBlock::Group(bg) => block_matches_kept_track(&bg.block, &kept_track_numbers),
-                });
-                if !cluster.blocks.is_empty() {
-                    filtered_clusters.push(cluster);
-                }
-            }
-            Tags::ID => {
-                let mut tags = Tags::read_element(&child_header, &mut full_reader)?;
-                for tag in &mut tags.tag {
-                    tag.targets.tag_track_uid.retain(|uid| !removed_track_uids.contains(&**uid));
-                }
-                filtered_tags.push(tags);
-            }
-            Info::ID => { info = Some(Info::read_element(&child_header, &mut full_reader)?); }
-            Attachments::ID => { attachments = Some(Attachments::read_element(&child_header, &mut full_reader)?); }
-            Chapters::ID => { chapters = Some(Chapters::read_element(&child_header, &mut full_reader)?); }
-            _ => {
-                let size = *child_header.size as usize;
-                let mut discard = vec![0u8; 8192.min(size)];
-                let mut remaining = size;
-                while remaining > 0 {
-                    let to_read = remaining.min(discard.len());
-                    full_reader.read_exact(&mut discard[..to_read])?;
-                    remaining -= to_read;
-                }
+    let filtered_tracks = {
+        let mut t = seg_view.tracks.clone();
+        if let Some(ref mut tracks_data) = t {
+            tracks_data.track_entry.retain(|te| kept_track_numbers.contains(&(*te.track_number).into()));
+            apply_flag_mods(tracks_data, set_default, clear_default, set_forced, clear_forced, set_enabled, clear_enabled);
+        }
+        t
+    };
+    let filtered_tags: Vec<Tags> = {
+        let mut tags = seg_view.tags.clone();
+        for tag in &mut tags {
+            for t in &mut tag.tag {
+                t.targets.tag_track_uid.retain(|uid| !removed_track_uids.contains(&**uid));
             }
         }
-    }
+        tags
+    };
 
-    let info = info.context("No Info element found in segment")?;
+    // Phase 3: Stream the MKV file with track filtering
     let out_file = File::create(output).with_context(|| format!("Failed to create output file {}", output.display()))?;
     let mut writer = BufWriter::new(out_file);
+    let mut reader = BufReader::new(File::open(input)?);
 
-    write_segment_streaming(
-        &mut writer, &ebml, &info, &filtered_tracks,
-        &mut filtered_clusters.into_iter(), &filtered_tags, &attachments, &chapters,
+    let cluster_count = stream_mkv_with_filter(
+        &mut reader, &mut writer,
+        seg_view, &kept_track_numbers,
+        &filtered_tracks, &filtered_tags,
+        &seg_view.attachments, &seg_view.chapters,
     )?;
 
     println!();
@@ -1346,7 +1377,7 @@ fn cmd_strip(
     if n_removed == 0 {
         println!("No tracks removed.");
     } else {
-        println!("✓ Kept {} track(s), stripped {} track(s)", n_kept, n_removed);
+        println!("✓ Kept {} track(s), stripped {} track(s) ({} clusters)", n_kept, n_removed, cluster_count);
         let removed_table = TrackTable::build(&removed_infos);
         for row in &removed_table.rows {
             println!("  {}", removed_table.row_line(row).trim_start());
@@ -1356,6 +1387,7 @@ fn cmd_strip(
 
     Ok(())
 }
+
 
 // ---------------------------------------------------------------------------
 // Extract command
@@ -1757,6 +1789,7 @@ fn cmd_keep(input: &PathBuf, output: &PathBuf, keep_ids: &[u64],
 
     let kept_set: HashSet<u64> = keep_ids.iter().copied().collect();
 
+    // Phase 1: Read metadata using MatroskaView (lightweight — no clusters loaded)
     let mut reader = BufReader::new(File::open(input)?);
     let view = MatroskaView::new(&mut reader)
         .with_context(|| format!("Failed to parse MKV metadata from {}", input.display()))?;
@@ -1788,7 +1821,6 @@ fn cmd_keep(input: &PathBuf, output: &PathBuf, keep_ids: &[u64],
         }
     }
 
-    // Validate that all requested IDs actually exist
     for id in keep_ids {
         if !kept_set.contains(id) || !tracks.track_entry.iter().any(|te| *te.track_number == *id) {
             bail!("Track ID {} not found in the MKV file. Use 'mkv-strip list' to see available tracks.", id);
@@ -1817,15 +1849,7 @@ fn cmd_keep(input: &PathBuf, output: &PathBuf, keep_ids: &[u64],
         println!("  {}{}", pad_right("STRIP", label_w), table.row_line(row).trim_start());
     }
 
-    // Re-read and reconstruct
-    let mut full_reader = BufReader::new(File::open(input)?);
-    let ebml = Ebml::read_from(&mut full_reader)?;
-    let segment_header = Header::read_from(&mut full_reader)?;
-    if segment_header.id != Segment::ID {
-        bail!("Expected Segment element, got {}", segment_header.id);
-    }
-    let segment_data_start = full_reader.stream_position()?;
-
+    // Phase 2: Prepare filtered metadata
     let removed_track_uids: HashSet<u64> = tracks
         .track_entry
         .iter()
@@ -1833,70 +1857,34 @@ fn cmd_keep(input: &PathBuf, output: &PathBuf, keep_ids: &[u64],
         .map(|te| *te.track_uid)
         .collect();
 
-    full_reader.seek(std::io::SeekFrom::Start(segment_data_start))?;
-
-    let mut filtered_tracks: Option<Tracks> = None;
-    let mut filtered_clusters: Vec<Cluster> = Vec::new();
-    let mut filtered_tags: Vec<Tags> = Vec::new();
-    let mut info: Option<Info> = None;
-    let mut attachments: Option<Attachments> = None;
-    let mut chapters: Option<Chapters> = None;
-
-    let segment_size = if segment_header.size.is_unknown { u64::MAX } else { *segment_header.size };
-    let segment_end = if segment_size == u64::MAX { u64::MAX } else { segment_data_start + segment_size };
-
-    loop {
-        let pos = full_reader.stream_position()?;
-        if pos >= segment_end { break; }
-        let Ok(child_header) = Header::read_from(&mut full_reader) else { break; };
-
-        match child_header.id {
-            Tracks::ID => {
-                let mut tracks_data = Tracks::read_element(&child_header, &mut full_reader)?;
-                tracks_data.track_entry.retain(|te| kept_track_numbers.contains(&(*te.track_number).into()));
-                apply_flag_mods(&mut tracks_data, set_default, clear_default, set_forced, clear_forced, set_enabled, clear_enabled);
-                filtered_tracks = Some(tracks_data);
-            }
-            Cluster::ID => {
-                let mut cluster = Cluster::read_element(&child_header, &mut full_reader)?;
-                cluster.blocks.retain(|block| match block {
-                    ClusterBlock::Simple(sb) => block_matches_kept_track(sb, &kept_track_numbers),
-                    ClusterBlock::Group(bg) => block_matches_kept_track(&bg.block, &kept_track_numbers),
-                });
-                if !cluster.blocks.is_empty() {
-                    filtered_clusters.push(cluster);
-                }
-            }
-            Tags::ID => {
-                let mut tags = Tags::read_element(&child_header, &mut full_reader)?;
-                for tag in &mut tags.tag {
-                    tag.targets.tag_track_uid.retain(|uid| !removed_track_uids.contains(&**uid));
-                }
-                filtered_tags.push(tags);
-            }
-            Info::ID => { info = Some(Info::read_element(&child_header, &mut full_reader)?); }
-            Attachments::ID => { attachments = Some(Attachments::read_element(&child_header, &mut full_reader)?); }
-            Chapters::ID => { chapters = Some(Chapters::read_element(&child_header, &mut full_reader)?); }
-            _ => {
-                let size = *child_header.size as usize;
-                let mut discard = vec![0u8; 8192.min(size)];
-                let mut remaining = size;
-                while remaining > 0 {
-                    let to_read = remaining.min(discard.len());
-                    full_reader.read_exact(&mut discard[..to_read])?;
-                    remaining -= to_read;
-                }
+    let filtered_tracks = {
+        let mut t = seg_view.tracks.clone();
+        if let Some(ref mut tracks_data) = t {
+            tracks_data.track_entry.retain(|te| kept_track_numbers.contains(&(*te.track_number).into()));
+            apply_flag_mods(tracks_data, set_default, clear_default, set_forced, clear_forced, set_enabled, clear_enabled);
+        }
+        t
+    };
+    let filtered_tags: Vec<Tags> = {
+        let mut tags = seg_view.tags.clone();
+        for tag in &mut tags {
+            for t in &mut tag.tag {
+                t.targets.tag_track_uid.retain(|uid| !removed_track_uids.contains(&**uid));
             }
         }
-    }
+        tags
+    };
 
-    let info = info.context("No Info element found in segment")?;
+    // Phase 3: Stream the MKV file with track filtering
     let out_file = File::create(output).with_context(|| format!("Failed to create output file {}", output.display()))?;
     let mut writer = BufWriter::new(out_file);
+    let mut reader = BufReader::new(File::open(input)?);
 
-    write_segment_streaming(
-        &mut writer, &ebml, &info, &filtered_tracks,
-        &mut filtered_clusters.into_iter(), &filtered_tags, &attachments, &chapters,
+    let cluster_count = stream_mkv_with_filter(
+        &mut reader, &mut writer,
+        seg_view, &kept_track_numbers,
+        &filtered_tracks, &filtered_tags,
+        &seg_view.attachments, &seg_view.chapters,
     )?;
 
     println!();
@@ -1905,7 +1893,7 @@ fn cmd_keep(input: &PathBuf, output: &PathBuf, keep_ids: &[u64],
     if n_removed == 0 {
         println!("No tracks removed.");
     } else {
-        println!("✓ Kept {} track(s), stripped {} track(s)", n_kept, n_removed);
+        println!("✓ Kept {} track(s), stripped {} track(s) ({} clusters)", n_kept, n_removed, cluster_count);
         let removed_table = TrackTable::build(&removed_infos);
         for row in &removed_table.rows {
             println!("  {}", removed_table.row_line(row).trim_start());
@@ -1915,6 +1903,7 @@ fn cmd_keep(input: &PathBuf, output: &PathBuf, keep_ids: &[u64],
 
     Ok(())
 }
+
 
 // ---------------------------------------------------------------------------
 // Main
