@@ -78,9 +78,14 @@ struct TrackInfo {
     language: String,
     language_bcp47: Option<String>,
     name: Option<String>,
+    flag_enabled: bool,
     flag_default: bool,
     flag_forced: bool,
-    flag_enabled: bool,
+    flag_hearing_impaired: bool,
+    flag_visual_impaired: bool,
+    flag_text_descriptions: bool,
+    flag_original: bool,
+    flag_commentary: bool,
 }
 
 impl TrackInfo {
@@ -93,9 +98,14 @@ impl TrackInfo {
             language: te.language.0.clone(),
             language_bcp47: te.language_bcp47.as_ref().map(|l| l.0.clone()),
             name: te.name.as_ref().map(|n| n.0.clone()),
+            flag_enabled: *te.flag_enabled != 0,
             flag_default: *te.flag_default != 0,
             flag_forced: *te.flag_forced != 0,
-            flag_enabled: *te.flag_enabled != 0,
+            flag_hearing_impaired: te.flag_hearing_impaired.map_or(false, |f| *f != 0),
+            flag_visual_impaired: te.flag_visual_impaired.map_or(false, |f| *f != 0),
+            flag_text_descriptions: te.flag_text_descriptions.map_or(false, |f| *f != 0),
+            flag_original: te.flag_original.map_or(false, |f| *f != 0),
+            flag_commentary: te.flag_commentary.map_or(false, |f| *f != 0),
         }
     }
 
@@ -111,9 +121,14 @@ impl TrackInfo {
 
     fn flags_display(&self) -> String {
         let flags = [
+            self.flag_enabled.then_some("enabled"),
             self.flag_default.then_some("default"),
             self.flag_forced.then_some("forced"),
-            self.flag_enabled.then_some("enabled"),
+            self.flag_hearing_impaired.then_some("hearing-impaired"),
+            self.flag_visual_impaired.then_some("visual-impaired"),
+            self.flag_text_descriptions.then_some("descriptions"),
+            self.flag_original.then_some("original"),
+            self.flag_commentary.then_some("commentary"),
         ]
         .into_iter()
         .flatten()
@@ -489,6 +504,24 @@ enum Commands {
         /// Remove ALL video tracks (dangerous!)
         #[arg(long)]
         no_video: bool,
+        /// Set tracks as default by ID (comma-separated)
+        #[arg(long = "set-default", value_delimiter = ',')]
+        set_default: Vec<u64>,
+        /// Clear default flag from tracks by ID (comma-separated)
+        #[arg(long = "clear-default", value_delimiter = ',')]
+        clear_default: Vec<u64>,
+        /// Set tracks as forced by ID (comma-separated)
+        #[arg(long = "set-forced", value_delimiter = ',')]
+        set_forced: Vec<u64>,
+        /// Clear forced flag from tracks by ID (comma-separated)
+        #[arg(long = "clear-forced", value_delimiter = ',')]
+        clear_forced: Vec<u64>,
+        /// Set tracks as enabled by ID (comma-separated)
+        #[arg(long = "set-enabled", value_delimiter = ',')]
+        set_enabled: Vec<u64>,
+        /// Clear enabled flag from tracks by ID (comma-separated)
+        #[arg(long = "clear-enabled", value_delimiter = ',')]
+        clear_enabled: Vec<u64>,
     },
     /// Extract subtitle tracks from an MKV file to SRT
     Extract {
@@ -531,8 +564,47 @@ enum Commands {
         /// Set as forced subtitle track
         #[arg(long)]
         forced: bool,
+        /// Set as hearing-impaired track (for users with hearing impairments)
+        #[arg(long)]
+        hearing_impaired: bool,
+        /// Set as visual-impaired track (for users with visual impairments)
+        #[arg(long)]
+        visual_impaired: bool,
+        /// Set as text descriptions track (describes video content for visually impaired users)
+        #[arg(long)]
+        descriptions: bool,
+        /// Set as original language track
+        #[arg(long)]
+        original: bool,
+        /// Set as commentary track
+        #[arg(long)]
+        commentary: bool,
     },
 
+}
+
+// ---------------------------------------------------------------------------
+// Apply track flag modifications
+// ---------------------------------------------------------------------------
+fn apply_flag_mods(tracks: &mut Tracks, set_default: &[u64], clear_default: &[u64],
+                   set_forced: &[u64], clear_forced: &[u64],
+                   set_enabled: &[u64], clear_enabled: &[u64]) {
+    let set_default_set: HashSet<u64> = set_default.iter().copied().collect();
+    let clear_default_set: HashSet<u64> = clear_default.iter().copied().collect();
+    let set_forced_set: HashSet<u64> = set_forced.iter().copied().collect();
+    let clear_forced_set: HashSet<u64> = clear_forced.iter().copied().collect();
+    let set_enabled_set: HashSet<u64> = set_enabled.iter().copied().collect();
+    let clear_enabled_set: HashSet<u64> = clear_enabled.iter().copied().collect();
+
+    for te in &mut tracks.track_entry {
+        let tn = *te.track_number;
+        if set_default_set.contains(&tn) { te.flag_default = FlagDefault(1); }
+        if clear_default_set.contains(&tn) { te.flag_default = FlagDefault(0); }
+        if set_forced_set.contains(&tn) { te.flag_forced = FlagForced(1); }
+        if clear_forced_set.contains(&tn) { te.flag_forced = FlagForced(0); }
+        if set_enabled_set.contains(&tn) { te.flag_enabled = FlagEnabled(1); }
+        if clear_enabled_set.contains(&tn) { te.flag_enabled = FlagEnabled(0); }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -585,10 +657,16 @@ fn cmd_strip(
     no_audio: bool,
     no_subtitle: bool,
     no_video: bool,
+    set_default: &[u64],
+    clear_default: &[u64],
+    set_forced: &[u64],
+    clear_forced: &[u64],
+    set_enabled: &[u64],
+    clear_enabled: &[u64],
 ) -> Result<()> {
     // When --keep is used, delegate to the keep-by-ID logic
     if !keep_ids.is_empty() {
-        return cmd_keep(input, output, keep_ids);
+        return cmd_keep(input, output, keep_ids, set_default, clear_default, set_forced, clear_forced, set_enabled, clear_enabled);
     }
 
     if no_audio && !keep_audio.is_empty() {
@@ -737,6 +815,7 @@ fn cmd_strip(
             Tracks::ID => {
                 let mut tracks_data = Tracks::read_element(&child_header, &mut full_reader)?;
                 tracks_data.track_entry.retain(|te| kept_track_numbers.contains(&(*te.track_number).into()));
+                apply_flag_mods(&mut tracks_data, set_default, clear_default, set_forced, clear_forced, set_enabled, clear_enabled);
                 filtered_tracks = Some(tracks_data);
             }
             Cluster::ID => {
@@ -988,6 +1067,11 @@ fn cmd_add(
     name: &Option<String>,
     default: bool,
     forced: bool,
+    hearing_impaired: bool,
+    visual_impaired: bool,
+    descriptions: bool,
+    original: bool,
+    commentary: bool,
 ) -> Result<()> {
     // Parse the SRT file
     let srt_content = std::fs::read_to_string(srt_path)
@@ -1087,11 +1171,11 @@ fn cmd_add(
         flag_enabled: FlagEnabled(1),
         flag_default: FlagDefault(if default { 1 } else { 0 }),
         flag_forced: FlagForced(if forced { 1 } else { 0 }),
-        flag_hearing_impaired: None,
-        flag_visual_impaired: None,
-        flag_text_descriptions: None,
-        flag_original: None,
-        flag_commentary: None,
+        flag_hearing_impaired: if hearing_impaired { Some(FlagHearingImpaired(1)) } else { None },
+        flag_visual_impaired: if visual_impaired { Some(FlagVisualImpaired(1)) } else { None },
+        flag_text_descriptions: if descriptions { Some(FlagTextDescriptions(1)) } else { None },
+        flag_original: if original { Some(FlagOriginal(1)) } else { None },
+        flag_commentary: if commentary { Some(FlagCommentary(1)) } else { None },
         flag_lacing: FlagLacing(0),
         default_duration: None,
         default_decoded_field_duration: None,
@@ -1140,6 +1224,11 @@ fn cmd_add(
     }
     if default { println!("  Default: yes"); }
     if forced { println!("  Forced: yes"); }
+    if hearing_impaired { println!("  Hearing-impaired: yes"); }
+    if visual_impaired { println!("  Visual-impaired: yes"); }
+    if descriptions { println!("  Descriptions: yes"); }
+    if original { println!("  Original: yes"); }
+    if commentary { println!("  Commentary: yes"); }
     println!("Output: {}", output_path.display());
 
     Ok(())
@@ -1182,7 +1271,10 @@ fn encode_vint(value: u64, buf: &mut Vec<u8>) {
 // Keep command — keep only specified track IDs, strip the rest
 // ---------------------------------------------------------------------------
 
-fn cmd_keep(input: &PathBuf, output: &PathBuf, keep_ids: &[u64]) -> Result<()> {
+fn cmd_keep(input: &PathBuf, output: &PathBuf, keep_ids: &[u64],
+           set_default: &[u64], clear_default: &[u64],
+           set_forced: &[u64], clear_forced: &[u64],
+           set_enabled: &[u64], clear_enabled: &[u64]) -> Result<()> {
     if keep_ids.is_empty() {
         bail!("No track IDs specified. Use -k or --keep with comma-separated track numbers (e.g. 1,2,4)");
     }
@@ -1286,6 +1378,7 @@ fn cmd_keep(input: &PathBuf, output: &PathBuf, keep_ids: &[u64]) -> Result<()> {
             Tracks::ID => {
                 let mut tracks_data = Tracks::read_element(&child_header, &mut full_reader)?;
                 tracks_data.track_entry.retain(|te| kept_track_numbers.contains(&(*te.track_number).into()));
+                apply_flag_mods(&mut tracks_data, set_default, clear_default, set_forced, clear_forced, set_enabled, clear_enabled);
                 filtered_tracks = Some(tracks_data);
             }
             Cluster::ID => {
@@ -1369,12 +1462,14 @@ fn main() -> Result<()> {
             input, output, keep_ids, keep_audio, remove_audio,
             keep_subtitle, remove_subtitle,
             no_audio, no_subtitle, no_video,
+            set_default, clear_default, set_forced, clear_forced, set_enabled, clear_enabled,
         }) => cmd_strip(&input, &output, &keep_ids, &keep_audio, &remove_audio,
-            &keep_subtitle, &remove_subtitle, no_audio, no_subtitle, no_video),
+            &keep_subtitle, &remove_subtitle, no_audio, no_subtitle, no_video,
+            &set_default, &clear_default, &set_forced, &clear_forced, &set_enabled, &clear_enabled),
         Some(Commands::Extract { input, output_dir, track_numbers, languages }) =>
             cmd_extract(&input, &output_dir, &track_numbers, &languages),
-        Some(Commands::Add { input, srt, output, lang, lang_bcp47, name, default, forced }) =>
-            cmd_add(&input, &srt, &output, &lang, &lang_bcp47, &name, default, forced),
+        Some(Commands::Add { input, srt, output, lang, lang_bcp47, name, default, forced, hearing_impaired, visual_impaired, descriptions, original, commentary }) =>
+            cmd_add(&input, &srt, &output, &lang, &lang_bcp47, &name, default, forced, hearing_impaired, visual_impaired, descriptions, original, commentary),
         None => {
             let mut cmd = Cli::command();
             cmd.print_help()?;
