@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, CommandFactory};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, Write};
@@ -440,7 +440,25 @@ fn write_mkv(output: &PathBuf, data: &MkvFullData) -> Result<()> {
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
+
+    /// Shorthand: list tracks when no subcommand given, or when used with -l
+    /// If provided without a subcommand, lists tracks in the file
+    #[arg(short = 'l', long = "list")]
+    list_file: Option<PathBuf>,
+
+    /// Shorthand: keep only specified track IDs (comma-separated)
+    /// When used, also requires --keep-input and --keep-output
+    #[arg(short = 'k', long = "keep", value_delimiter = ',')]
+    keep_ids: Vec<u64>,
+
+    /// Input file for --keep shorthand
+    #[arg(long = "keep-input", requires = "keep_ids")]
+    keep_input: Option<PathBuf>,
+
+    /// Output file for --keep shorthand
+    #[arg(long = "keep-output", requires = "keep_ids")]
+    keep_output: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -521,6 +539,19 @@ enum Commands {
         /// Set as forced subtitle track
         #[arg(long)]
         forced: bool,
+    },
+    /// Keep only specified track IDs and strip the rest
+    /// Track IDs are the # numbers shown by 'list' (comma-separated)
+    Keep {
+        /// Input MKV file
+        #[arg(short, long)]
+        input: PathBuf,
+        /// Output MKV file
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Track IDs to KEEP (comma-separated, e.g. "1,2,4")
+        #[arg(long = "keep", value_delimiter = ',')]
+        ids: Vec<u64>,
     },
 }
 
@@ -1162,22 +1193,218 @@ fn encode_vint(value: u64, buf: &mut Vec<u8>) {
 
 
 // ---------------------------------------------------------------------------
+// Keep command — keep only specified track IDs, strip the rest
+// ---------------------------------------------------------------------------
+
+fn cmd_keep(input: &PathBuf, output: &PathBuf, keep_ids: &[u64]) -> Result<()> {
+    if keep_ids.is_empty() {
+        bail!("No track IDs specified. Use -k or --keep with comma-separated track numbers (e.g. 1,2,4)");
+    }
+
+    let kept_set: HashSet<u64> = keep_ids.iter().copied().collect();
+
+    let mut reader = BufReader::new(File::open(input)?);
+    let view = MatroskaView::new(&mut reader)
+        .with_context(|| format!("Failed to parse MKV metadata from {}", input.display()))?;
+
+    if view.segments.len() != 1 {
+        bail!(
+            "Expected exactly 1 segment, found {}. Multi-segment files are not yet supported.",
+            view.segments.len()
+        );
+    }
+
+    let seg_view = &view.segments[0];
+    let tracks = seg_view
+        .tracks
+        .as_ref()
+        .context("No Tracks element found in MKV file")?;
+
+    let mut kept_infos: Vec<TrackInfo> = Vec::new();
+    let mut removed_infos: Vec<TrackInfo> = Vec::new();
+    let mut kept_track_numbers: HashSet<u64> = HashSet::new();
+
+    for te in tracks.track_entry.iter() {
+        let info = TrackInfo::from_track_entry(te);
+        if kept_set.contains(&info.number) {
+            kept_infos.push(info.clone());
+            kept_track_numbers.insert(info.number);
+        } else {
+            removed_infos.push(info);
+        }
+    }
+
+    // Validate that all requested IDs actually exist
+    for id in keep_ids {
+        if !kept_set.contains(id) || !tracks.track_entry.iter().any(|te| *te.track_number == *id) {
+            bail!("Track ID {} not found in the MKV file. Use 'mkv-strip list' to see available tracks.", id);
+        }
+    }
+
+    if kept_track_numbers.is_empty() {
+        bail!("No valid track IDs to keep. Use 'mkv-strip list' to see available tracks.");
+    }
+
+    let all_infos: Vec<TrackInfo> = kept_infos.iter().chain(removed_infos.iter()).cloned().collect();
+    let table = TrackTable::build(&all_infos);
+
+    let label_w = 5;
+    println!("  {}{}", pad_right("", label_w), table.header_line().trim_start());
+    println!("  {}{}", pad_right("", label_w), table.separator_line().trim_start());
+
+    for info in &kept_infos {
+        let idx = all_infos.iter().position(|a| a.number == info.number).unwrap();
+        let row = &table.rows[idx];
+        println!("  {}{}", pad_right("KEEP", label_w), table.row_line(row).trim_start());
+    }
+    for info in &removed_infos {
+        let idx = all_infos.iter().position(|a| a.number == info.number).unwrap();
+        let row = &table.rows[idx];
+        println!("  {}{}", pad_right("STRIP", label_w), table.row_line(row).trim_start());
+    }
+
+    // Re-read and reconstruct
+    let mut full_reader = BufReader::new(File::open(input)?);
+    let ebml = Ebml::read_from(&mut full_reader)?;
+    let segment_header = Header::read_from(&mut full_reader)?;
+    if segment_header.id != Segment::ID {
+        bail!("Expected Segment element, got {}", segment_header.id);
+    }
+    let segment_data_start = full_reader.stream_position()?;
+
+    let removed_track_uids: HashSet<u64> = tracks
+        .track_entry
+        .iter()
+        .filter(|te| !kept_track_numbers.contains(&(*te.track_number).into()))
+        .map(|te| *te.track_uid)
+        .collect();
+
+    full_reader.seek(std::io::SeekFrom::Start(segment_data_start))?;
+
+    let mut filtered_tracks: Option<Tracks> = None;
+    let mut filtered_clusters: Vec<Cluster> = Vec::new();
+    let mut filtered_tags: Vec<Tags> = Vec::new();
+    let mut info: Option<Info> = None;
+    let mut attachments: Option<Attachments> = None;
+    let mut chapters: Option<Chapters> = None;
+
+    let segment_size = if segment_header.size.is_unknown { u64::MAX } else { *segment_header.size };
+    let segment_end = if segment_size == u64::MAX { u64::MAX } else { segment_data_start + segment_size };
+
+    loop {
+        let pos = full_reader.stream_position()?;
+        if pos >= segment_end { break; }
+        let Ok(child_header) = Header::read_from(&mut full_reader) else { break; };
+
+        match child_header.id {
+            Tracks::ID => {
+                let mut tracks_data = Tracks::read_element(&child_header, &mut full_reader)?;
+                tracks_data.track_entry.retain(|te| kept_track_numbers.contains(&(*te.track_number).into()));
+                filtered_tracks = Some(tracks_data);
+            }
+            Cluster::ID => {
+                let mut cluster = Cluster::read_element(&child_header, &mut full_reader)?;
+                cluster.blocks.retain(|block| match block {
+                    ClusterBlock::Simple(sb) => block_matches_kept_track(sb, &kept_track_numbers),
+                    ClusterBlock::Group(bg) => block_matches_kept_track(&bg.block, &kept_track_numbers),
+                });
+                if !cluster.blocks.is_empty() {
+                    filtered_clusters.push(cluster);
+                }
+            }
+            Tags::ID => {
+                let mut tags = Tags::read_element(&child_header, &mut full_reader)?;
+                for tag in &mut tags.tag {
+                    tag.targets.tag_track_uid.retain(|uid| !removed_track_uids.contains(&**uid));
+                }
+                filtered_tags.push(tags);
+            }
+            Info::ID => { info = Some(Info::read_element(&child_header, &mut full_reader)?); }
+            Attachments::ID => { attachments = Some(Attachments::read_element(&child_header, &mut full_reader)?); }
+            Chapters::ID => { chapters = Some(Chapters::read_element(&child_header, &mut full_reader)?); }
+            _ => {
+                let size = *child_header.size as usize;
+                let mut discard = vec![0u8; 8192.min(size)];
+                let mut remaining = size;
+                while remaining > 0 {
+                    let to_read = remaining.min(discard.len());
+                    full_reader.read_exact(&mut discard[..to_read])?;
+                    remaining -= to_read;
+                }
+            }
+        }
+    }
+
+    let info = info.context("No Info element found in segment")?;
+    let out_file = File::create(output).with_context(|| format!("Failed to create output file {}", output.display()))?;
+    let mut writer = BufWriter::new(out_file);
+    ebml.write_to(&mut writer)?;
+
+    let segment = Segment {
+        crc32: None, void: None, seek_head: vec![], info,
+        cluster: filtered_clusters, tracks: filtered_tracks, cues: None,
+        attachments, chapters, tags: filtered_tags,
+    };
+    segment.write_to(&mut writer)?;
+    writer.flush()?;
+
+    println!();
+    let n_removed = removed_infos.len();
+    let n_kept = kept_infos.len();
+    if n_removed == 0 {
+        println!("No tracks removed.");
+    } else {
+        println!("✓ Kept {} track(s), stripped {} track(s)", n_kept, n_removed);
+        let removed_table = TrackTable::build(&removed_infos);
+        for row in &removed_table.rows {
+            println!("  {}", removed_table.row_line(row).trim_start());
+        }
+    }
+    println!("Output: {}", output.display());
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Handle global shortcuts first
+
+    // -k/--keep: shorthand for 'keep' command
+    if !cli.keep_ids.is_empty() {
+        let input = cli.keep_input.as_ref()
+            .context("--keep requires --keep-input. Usage: mkv-strip -k 1,2,4 --keep-input input.mkv --keep-output output.mkv")?;
+        let output = cli.keep_output.as_ref()
+            .context("--keep requires --keep-output. Usage: mkv-strip -k 1,2,4 --keep-input input.mkv --keep-output output.mkv")?;
+        return cmd_keep(input, output, &cli.keep_ids);
+    }
+
+    // -l/--list: shorthand for 'list' command
+    if let Some(ref list_file) = cli.list_file {
+        return cmd_list(list_file);
+    }
+
+    // Default: no subcommand → show help
     match cli.command {
-        Commands::List { input } => cmd_list(&input),
-        Commands::Strip {
+        Some(Commands::List { input }) => cmd_list(&input),
+        Some(Commands::Strip {
             input, output, keep_audio, remove_audio,
             keep_subtitle, remove_subtitle,
             no_audio, no_subtitle, no_video,
-        } => cmd_strip(&input, &output, &keep_audio, &remove_audio,
+        }) => cmd_strip(&input, &output, &keep_audio, &remove_audio,
             &keep_subtitle, &remove_subtitle, no_audio, no_subtitle, no_video),
-        Commands::Extract { input, output_dir, track_numbers, languages } =>
+        Some(Commands::Extract { input, output_dir, track_numbers, languages }) =>
             cmd_extract(&input, &output_dir, &track_numbers, &languages),
-        Commands::Add { input, srt, output, lang, lang_bcp47, name, default, forced } =>
+        Some(Commands::Add { input, srt, output, lang, lang_bcp47, name, default, forced }) =>
             cmd_add(&input, &srt, &output, &lang, &lang_bcp47, &name, default, forced),
+        Some(Commands::Keep { input, output, ids }) => cmd_keep(&input, &output, &ids),
+        None => {
+            let mut cmd = Cli::command();
+            cmd.print_help()?;
+            Ok(())
+        }
     }
 }
