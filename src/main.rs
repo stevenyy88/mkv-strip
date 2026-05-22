@@ -446,19 +446,6 @@ struct Cli {
     /// If provided without a subcommand, lists tracks in the file
     #[arg(short = 'l', long = "list")]
     list_file: Option<PathBuf>,
-
-    /// Shorthand: keep only specified track IDs (comma-separated)
-    /// When used, also requires --keep-input and --keep-output
-    #[arg(short = 'k', long = "keep", value_delimiter = ',')]
-    keep_ids: Vec<u64>,
-
-    /// Input file for --keep shorthand
-    #[arg(long = "keep-input", requires = "keep_ids")]
-    keep_input: Option<PathBuf>,
-
-    /// Output file for --keep shorthand
-    #[arg(long = "keep-output", requires = "keep_ids")]
-    keep_output: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -476,6 +463,11 @@ enum Commands {
         /// Output MKV file
         #[arg(short, long)]
         output: PathBuf,
+        /// Track IDs to KEEP (comma-separated, e.g. "1,2,4").
+        /// Keeps only the specified track numbers; all others are stripped.
+        /// Use 'mkv-strip list' to see track IDs.
+        #[arg(short = 'k', long = "keep", value_delimiter = ',')]
+        keep_ids: Vec<u64>,
         /// Audio languages to KEEP (comma-separated, e.g. "eng,jpn"). Can be repeated.
         #[arg(short = 'a', long = "keep-audio", value_delimiter = ',')]
         keep_audio: Vec<String>,
@@ -540,19 +532,7 @@ enum Commands {
         #[arg(long)]
         forced: bool,
     },
-    /// Keep only specified track IDs and strip the rest
-    /// Track IDs are the # numbers shown by 'list' (comma-separated)
-    Keep {
-        /// Input MKV file
-        #[arg(short, long)]
-        input: PathBuf,
-        /// Output MKV file
-        #[arg(short, long)]
-        output: PathBuf,
-        /// Track IDs to KEEP (comma-separated, e.g. "1,2,4")
-        #[arg(long = "keep", value_delimiter = ',')]
-        ids: Vec<u64>,
-    },
+
 }
 
 // ---------------------------------------------------------------------------
@@ -597,6 +577,7 @@ fn block_matches_kept_track(data: &[u8], kept_tracks: &HashSet<u64>) -> bool {
 fn cmd_strip(
     input: &PathBuf,
     output: &PathBuf,
+    keep_ids: &[u64],
     keep_audio: &[String],
     remove_audio: &[String],
     keep_subtitle: &[String],
@@ -605,6 +586,11 @@ fn cmd_strip(
     no_subtitle: bool,
     no_video: bool,
 ) -> Result<()> {
+    // When --keep is used, delegate to the keep-by-ID logic
+    if !keep_ids.is_empty() {
+        return cmd_keep(input, output, keep_ids);
+    }
+
     if no_audio && !keep_audio.is_empty() {
         bail!("Cannot use --no-audio with --keep-audio");
     }
@@ -1371,17 +1357,6 @@ fn cmd_keep(input: &PathBuf, output: &PathBuf, keep_ids: &[u64]) -> Result<()> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Handle global shortcuts first
-
-    // -k/--keep: shorthand for 'keep' command
-    if !cli.keep_ids.is_empty() {
-        let input = cli.keep_input.as_ref()
-            .context("--keep requires --keep-input. Usage: mkv-strip -k 1,2,4 --keep-input input.mkv --keep-output output.mkv")?;
-        let output = cli.keep_output.as_ref()
-            .context("--keep requires --keep-output. Usage: mkv-strip -k 1,2,4 --keep-input input.mkv --keep-output output.mkv")?;
-        return cmd_keep(input, output, &cli.keep_ids);
-    }
-
     // -l/--list: shorthand for 'list' command
     if let Some(ref list_file) = cli.list_file {
         return cmd_list(list_file);
@@ -1391,16 +1366,15 @@ fn main() -> Result<()> {
     match cli.command {
         Some(Commands::List { input }) => cmd_list(&input),
         Some(Commands::Strip {
-            input, output, keep_audio, remove_audio,
+            input, output, keep_ids, keep_audio, remove_audio,
             keep_subtitle, remove_subtitle,
             no_audio, no_subtitle, no_video,
-        }) => cmd_strip(&input, &output, &keep_audio, &remove_audio,
+        }) => cmd_strip(&input, &output, &keep_ids, &keep_audio, &remove_audio,
             &keep_subtitle, &remove_subtitle, no_audio, no_subtitle, no_video),
         Some(Commands::Extract { input, output_dir, track_numbers, languages }) =>
             cmd_extract(&input, &output_dir, &track_numbers, &languages),
         Some(Commands::Add { input, srt, output, lang, lang_bcp47, name, default, forced }) =>
             cmd_add(&input, &srt, &output, &lang, &lang_bcp47, &name, default, forced),
-        Some(Commands::Keep { input, output, ids }) => cmd_keep(&input, &output, &ids),
         None => {
             let mut cmd = Cli::command();
             cmd.print_help()?;
