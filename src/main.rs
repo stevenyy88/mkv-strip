@@ -458,6 +458,126 @@ fn write_mkv(output: &PathBuf, data: &MkvFullData) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Streaming write — writes segment children one at a time to limit memory
+// ---------------------------------------------------------------------------
+
+/// Write the EBML header and a Segment element with unknown size,
+/// then write each child element individually.
+/// This avoids buffering the entire output file in memory.
+/// Encode a u64 value as an EBML VInt with the minimum number of bytes.
+/// Returns the encoded bytes including the marker bit.
+fn encode_vint_size(value: u64) -> Vec<u8> {
+    if value <= 0x7F {
+        vec![(0x80 | (value & 0x7F)) as u8]
+    } else if value <= 0x3FFF {
+        vec![0x40 | ((value >> 8) & 0x3F) as u8, (value & 0xFF) as u8]
+    } else if value <= 0x1FFFFF {
+        vec![0x20 | ((value >> 16) & 0x1F) as u8, ((value >> 8) & 0xFF) as u8, (value & 0xFF) as u8]
+    } else if value <= 0x0FFFFFFF {
+        vec![0x10 | ((value >> 24) & 0x0F) as u8, ((value >> 16) & 0xFF) as u8, ((value >> 8) & 0xFF) as u8, (value & 0xFF) as u8]
+    } else if value <= 0x07FFFFFFFF {
+        vec![0x08 | ((value >> 32) & 0x07) as u8, ((value >> 24) & 0xFF) as u8, ((value >> 16) & 0xFF) as u8, ((value >> 8) & 0xFF) as u8, (value & 0xFF) as u8]
+    } else if value <= 0x03FFFFFFFFFF {
+        vec![0x04 | ((value >> 40) & 0x03) as u8, ((value >> 32) & 0xFF) as u8, ((value >> 24) & 0xFF) as u8, ((value >> 16) & 0xFF) as u8, ((value >> 8) & 0xFF) as u8, (value & 0xFF) as u8]
+    } else if value <= 0x01FFFFFFFFFFFF {
+        vec![0x02 | ((value >> 48) & 0x01) as u8, ((value >> 40) & 0xFF) as u8, ((value >> 32) & 0xFF) as u8, ((value >> 24) & 0xFF) as u8, ((value >> 16) & 0xFF) as u8, ((value >> 8) & 0xFF) as u8, (value & 0xFF) as u8]
+    } else {
+        vec![0x01, ((value >> 48) & 0xFF) as u8, ((value >> 40) & 0xFF) as u8, ((value >> 32) & 0xFF) as u8, ((value >> 24) & 0xFF) as u8, ((value >> 16) & 0xFF) as u8, ((value >> 8) & 0xFF) as u8, (value & 0xFF) as u8]
+    }
+}
+
+/// Write an MKV file in streaming fashion, writing one cluster at a time to limit memory usage.
+/// The Segment header is written with a placeholder size, which is patched after all content is written.
+fn write_segment_streaming<W: Write + Seek>(
+    writer: &mut W,
+    ebml: &Ebml,
+    info: &Info,
+    tracks: &Option<Tracks>,
+    clusters: &mut dyn Iterator<Item = Cluster>,
+    tags: &[Tags],
+    attachments: &Option<Attachments>,
+    chapters: &Option<Chapters>,
+) -> Result<()> {
+    // Write EBML header
+    ebml.write_to(writer)?;
+
+    // Write Segment header with placeholder size.
+    // Reserve 8 bytes for the size VInt (supports sizes up to 2^56 ≈ 72 PB).
+    // Segment ID: 4 bytes (0x18538067)
+    writer.write_all(&[0x18, 0x53, 0x80, 0x67])?; // Segment ID
+    let size_offset = writer.stream_position()?;
+    // Write 8-byte placeholder (unknown size = 0x01 FF FF FF FF FF FF FF)
+    writer.write_all(&[0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])?;
+    let content_start = writer.stream_position()?;
+
+    // Write metadata elements
+    info.write_to(writer)?;
+    if let Some(tracks) = tracks {
+        tracks.write_to(writer)?;
+    }
+    if let Some(attachments) = attachments {
+        attachments.write_to(writer)?;
+    }
+    if let Some(chapters) = chapters {
+        chapters.write_to(writer)?;
+    }
+
+    // Stream clusters — only one in memory at a time
+    while let Some(cluster) = clusters.next() {
+        cluster.write_to(writer)?;
+    }
+
+    // Write Tags
+    for tag in tags.iter() {
+        tag.write_to(writer)?;
+    }
+
+    // Patch the Segment size
+    let content_end = writer.stream_position()?;
+    let content_size = content_end - content_start;
+    let size_bytes = encode_vint_size(content_size);
+
+    // Write the actual size at the reserved offset
+    writer.seek(std::io::SeekFrom::Start(size_offset))?;
+    writer.write_all(&size_bytes)?;
+
+    // If size_bytes is shorter than 8 bytes, fill the gap with a Void element
+    let gap = 8 - size_bytes.len();
+    if gap > 0 {
+        // Use an EBML Void element (ID 0xEC) to fill the gap
+        // Void element: ID (1 byte 0xEC) + size + content of zeros
+        let void_content_size = gap - 2; // 2 bytes for Void element header minimum
+        if void_content_size > 0 {
+            writer.write_all(&[0xEC])?;
+            let void_size_vint = encode_vint_size(void_content_size as u64);
+            writer.write_all(&void_size_vint)?;
+            // The gap calculation accounts for: size_bytes + 0xEC + void_size_vint + void_content
+            // But we need to be precise about the total gap fill
+            // Total bytes after size_bytes: gap = 8 - size_bytes.len()
+            // We write: 0xEC (1 byte) + void_size_vint (? bytes) + void zeros (? bytes)
+            // We need: 1 + void_size_vint.len() + void_content_size = gap
+            // But void_content_size = gap - 1 - void_size_vint.len()
+            // So: 1 + void_size_vint.len() + (gap - 1 - void_size_vint.len()) = gap ✓
+            for _ in 0..void_content_size {
+                writer.write_all(&[0x00])?;
+            }
+        } else {
+            // void_content_size <= 0 means gap is 1 or 2
+            // For gap=2: write 0xEC 0x80 (Void element with size 0)
+            if gap == 2 {
+                writer.write_all(&[0xEC, 0x80])?;
+            }
+            // gap=1 is impossible for valid MKV; shouldn't happen with 8-byte reserve
+        }
+    }
+
+    // Seek to end to ensure proper file state
+    writer.seek(std::io::SeekFrom::End(0))?;
+    writer.flush()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 #[derive(Parser)]
@@ -1214,15 +1334,11 @@ fn cmd_strip(
     let info = info.context("No Info element found in segment")?;
     let out_file = File::create(output).with_context(|| format!("Failed to create output file {}", output.display()))?;
     let mut writer = BufWriter::new(out_file);
-    ebml.write_to(&mut writer)?;
 
-    let segment = Segment {
-        crc32: None, void: None, seek_head: vec![], info,
-        cluster: filtered_clusters, tracks: filtered_tracks, cues: None,
-        attachments, chapters, tags: filtered_tags,
-    };
-    segment.write_to(&mut writer)?;
-    writer.flush()?;
+    write_segment_streaming(
+        &mut writer, &ebml, &info, &filtered_tracks,
+        &mut filtered_clusters.into_iter(), &filtered_tags, &attachments, &chapters,
+    )?;
 
     println!();
     let n_removed = removed_infos.len();
@@ -1777,15 +1893,11 @@ fn cmd_keep(input: &PathBuf, output: &PathBuf, keep_ids: &[u64],
     let info = info.context("No Info element found in segment")?;
     let out_file = File::create(output).with_context(|| format!("Failed to create output file {}", output.display()))?;
     let mut writer = BufWriter::new(out_file);
-    ebml.write_to(&mut writer)?;
 
-    let segment = Segment {
-        crc32: None, void: None, seek_head: vec![], info,
-        cluster: filtered_clusters, tracks: filtered_tracks, cues: None,
-        attachments, chapters, tags: filtered_tags,
-    };
-    segment.write_to(&mut writer)?;
-    writer.flush()?;
+    write_segment_streaming(
+        &mut writer, &ebml, &info, &filtered_tracks,
+        &mut filtered_clusters.into_iter(), &filtered_tags, &attachments, &chapters,
+    )?;
 
     println!();
     let n_removed = removed_infos.len();

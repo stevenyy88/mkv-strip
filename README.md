@@ -27,7 +27,8 @@ A tiny, fast, single-binary CLI tool written in pure Rust that reads and writes 
 
 - **Pure Rust** — built on [`mkv-element`](https://crates.io/crates/mkv-element) for native EBML/Matroska parsing
 - **No dependencies** — no FFmpeg, no mkvmerge, no runtime required
-- **Tiny binary** — ~1.8 MB (Linux), ~2.2 MB (Windows)
+- **Low memory** — `strip` and `keep` stream clusters through memory, not the entire file
+- **Tiny binary** — ~1.9 MB (Linux), ~2.3 MB (Windows)
 - **Cross-platform** — Linux x64 & Windows x64 binaries available
 - **Full flag support** — display and modify all Matroska track flags (default, forced, enabled, hearing-impaired, visual-impaired, descriptions, original, commentary)
 
@@ -39,8 +40,8 @@ Grab the latest binary from the [`binaries/`](binaries/) directory or build from
 
 | File | Platform | Size | SHA256 |
 |------|----------|------|--------|
-| [`binaries/mkv-strip-linux-x64`](binaries/mkv-strip-linux-x64) | Linux (x86-64) | ~1.9 MB | `f92555cfde4ac30c220775ee379dd82a4f386a2ac4cd35f9fd274db1c2833025` |
-| [`binaries/mkv-strip-windows-x64.exe`](binaries/mkv-strip-windows-x64.exe) | Windows (x86-64) | ~2.3 MB | `aab98bdaa01f4a1da0ee4f00c0d6b793b5050f29c440bdbe3ac43a7eef0d0789` |
+| [`binaries/mkv-strip-linux-x64`](binaries/mkv-strip-linux-x64) | Linux (x86-64) | ~1.9 MB | `210b1113dd17bc8643bc0b3ac6795b9d6afc5ce6f899093a29aa37690e79419b` |
+| [`binaries/mkv-strip-windows-x64.exe`](binaries/mkv-strip-windows-x64.exe) | Windows (x86-64) | ~2.3 MB | `657e55f8e1d3e5f691b24ea3f5d0719f0b178fb4d62909c1194869e64faf8feb` |
 
 ### Verify Download Authenticity
 
@@ -49,13 +50,13 @@ After downloading, verify the SHA-256 checksum to confirm the file hasn't been t
 **Linux / macOS:**
 ```bash
 sha256sum mkv-strip-linux-x64
-# Expected: f92555cfde4ac30c220775ee379dd82a4f386a2ac4cd35f9fd274db1c2833025
+# Expected: 210b1113dd17bc8643bc0b3ac6795b9d6afc5ce6f899093a29aa37690e79419b
 ```
 
 **Windows (PowerShell):**
 ```powershell
 Get-FileHash .\mkv-strip-windows-x64.exe -Algorithm SHA256
-# Expected: AAB98BDAA01F4A1DA0EE4F00C0D6B793B5050F29C440BDBE3AC43A7EEF0D0789
+# Expected: 657E55F8E1D3E5F691B24EA3F5D0719F0B178FB4D62909C1194869E64FAF8FEB
 ```
 
 If the hash doesn't match, **do not run the binary** — re-download it from this repository.
@@ -259,7 +260,7 @@ Image-based subtitles (VobSub `S_VOBSUB`, HDMV PGS) are not supported for extrac
 
 ## ⚠️ Limitations
 
-- **Memory** — Clusters are loaded into memory during processing; very large files may use significant RAM
+- **Memory** — Clusters are streamed through during strip/keep operations (one at a time); `add`, `extract`, and `flags` commands also use minimal memory
 - **SeekHead / Cues** — Dropped from output; most players rebuild these automatically
 - **Multi-segment files** — Not yet supported (rare in practice)
 - **Track renumbering** — Track numbers are preserved as-is

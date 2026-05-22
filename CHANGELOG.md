@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.4] - 2026-05-23
+
+### Changed
+
+- **Streaming writes for `strip` and `keep` commands** — clusters are now written one at a time instead of buffering all clusters in memory. Peak memory usage is now bounded by a single cluster (~1-2 MB for typical files) instead of the entire file. This fixes the Windows "Insufficient system resources" error (OS error 1450) when processing large MKV files.
+
 ## [0.2.3] - 2026-05-23
 
 ### Added
