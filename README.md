@@ -37,7 +37,7 @@ Grab the latest binary from the [`binaries/`](binaries/) directory or build from
 | File | Platform | Size | SHA256 |
 |------|----------|------|--------|
 | [`binaries/mkv-strip-linux-x64`](binaries/mkv-strip-linux-x64) | Linux (x86-64) | ~1.8 MB | `048f4d5fcf84e1db9bdf35601f087ff66e755faf0c3369f0f9f99d8d3a103227` |
-| [`binaries/mkv-strip-windows-x64.exe`](binaries/mkv-strip-windows-x64.exe) | Windows (x86-64) | ~2.2 MB | `ce578c3987aca8d42abc3b00cf0a52538f944ac21889cab6a1bec0e3c8625e22` |
+| [`binaries/mkv-strip-windows-x64.exe`](binaries/mkv-strip-windows-x64.exe) | Windows (x86-64) | ~2.2 MB | `4c621180cf5300b932897bafe037dec7caf4ba57044367c6dcde9ff22af57e9a` |
 
 ### Verify Download Authenticity
 
@@ -52,7 +52,7 @@ sha256sum mkv-strip-linux-x64
 **Windows (PowerShell):**
 ```powershell
 Get-FileHash .\mkv-strip-windows-x64.exe -Algorithm SHA256
-# Expected: CE578C3987ACA8D42ABC3B00CF0A52538F944AC21889CAB6A1BEC0E3C8625E22
+# Expected: 4C621180CF5300B932897BAFE037DEC7CAF4BA57044367C6DCDE9FF22AF57E9A
 ```
 
 If the hash doesn't match, **do not run the binary** — re-download it from this repository.
