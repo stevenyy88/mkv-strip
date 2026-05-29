@@ -1923,13 +1923,25 @@ fn cmd_add(
         let text_bytes = entry.text.as_bytes();
         let relative_ts = (start_ticks as i64 - current_cluster_ts as i64) as i16;
 
+        // Calculate duration in track ticks for BlockDuration
+        let end_ticks = entry.end_ms * 1_000_000 / timestamp_scale;
+        let duration_ticks = end_ticks.saturating_sub(start_ticks).max(1);
+
         let mut block_data = Vec::new();
         encode_vint(new_track_number, &mut block_data);
         block_data.extend_from_slice(&relative_ts.to_be_bytes());
         block_data.push(0x80); // keyframe flag
         block_data.extend_from_slice(text_bytes);
 
-        current_blocks.push(ClusterBlock::Simple(SimpleBlock(Bytes::from(block_data))));
+        // Use BlockGroup with BlockDuration — text subtitles need explicit
+        // duration for players to know when to hide the subtitle.
+        let block_group = BlockGroup {
+            block: Block(Bytes::from(block_data)),
+            block_duration: Some(BlockDuration(duration_ticks)),
+            reference_priority: ReferencePriority(0),
+            ..Default::default()
+        };
+        current_blocks.push(ClusterBlock::Group(block_group));
     }
 
     if !current_blocks.is_empty() {
