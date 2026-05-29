@@ -1909,8 +1909,9 @@ fn cmd_add(
         });
     }
 
-    // Determine output path
-    let output_path = output.clone().unwrap_or_else(|| input.clone());
+    // Determine output path — when overwriting input, use a temp file first
+    let overwrite_input = output.is_none();
+    let output_path = output.clone().unwrap_or_else(|| input.with_extension("mkv-strip-tmp"));
 
     // Stream the MKV: copy all existing clusters, append subtitle clusters
     let out_file = File::create(&output_path)
@@ -1993,6 +1994,13 @@ fn cmd_add(
 
     writer.seek(SeekFrom::End(0))?;
     writer.flush()?;
+    drop(writer);
+
+    // If overwriting input, rename temp file over original
+    if overwrite_input {
+        std::fs::rename(&output_path, input)
+            .with_context(|| format!("Failed to replace {} with modified file", input.display()))?;
+    }
 
     println!();
     println!(
@@ -2009,7 +2017,8 @@ fn cmd_add(
     if descriptions { println!("  Descriptions: yes"); }
     if original { println!("  Original: yes"); }
     if commentary { println!("  Commentary: yes"); }
-    println!("Output: {}", output_path.display());
+    let display_path = if overwrite_input { input } else { &output_path };
+    println!("Output: {}", display_path.display());
 
     Ok(())
 }
