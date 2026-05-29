@@ -1990,13 +1990,47 @@ fn cmd_add(
         chapters.write_to(&mut writer)?;
     }
 
-    // Stream-copy all existing clusters from input
+    // Phase: Collect all clusters (existing + subtitle), then write them
+    // sorted by timestamp for correct interleaving.
+    //
+    // Strategy: Read each existing cluster into memory as raw bytes,
+    // extract its timestamp from the first Timestamp child element,
+    // then sort all clusters (existing raw + subtitle encoded) by timestamp
+    // and write them in order.
+    //
+    // Memory usage: each cluster is buffered individually (typically <32MB),
+    // but we only hold the raw bytes until writing — not the entire file.
     let segment_size = if segment_header.size.is_unknown { u64::MAX } else { *segment_header.size };
     let segment_end = if segment_size == u64::MAX { u64::MAX } else { segment_data_start + segment_size };
 
     reader.seek(SeekFrom::Start(segment_data_start))?;
-    let mut _cluster_count: u64 = 0;
 
+    // An existing cluster: raw bytes with its timestamp extracted
+    struct ExistingCluster {
+        timestamp: u64,
+        raw_header_and_body: Vec<u8>,
+    }
+    // A new subtitle cluster: already encoded as a Cluster element
+    struct SubtitleCluster {
+        timestamp: u64,
+        encoded: Cluster,
+    }
+    enum MergeCluster {
+        Existing(ExistingCluster),
+        Subtitle(SubtitleCluster),
+    }
+    impl MergeCluster {
+        fn timestamp(&self) -> u64 {
+            match self {
+                MergeCluster::Existing(c) => c.timestamp,
+                MergeCluster::Subtitle(c) => c.timestamp,
+            }
+        }
+    }
+
+    let mut all_clusters: Vec<MergeCluster> = Vec::new();
+
+    // Read existing clusters from input, buffering each one as raw bytes
     loop {
         let pos = reader.stream_position()?;
         if pos >= segment_end { break; }
@@ -2005,22 +2039,54 @@ fn cmd_add(
 
         match child_header.id {
             Cluster::ID => {
-                // Raw copy the entire cluster (header + body) — no decode needed
+                // Read the entire cluster (header + body) into memory
+                let total_size = (header_len + *child_header.size) as usize;
                 reader.seek(SeekFrom::Start(pos))?;
-                copy_n_bytes(&mut reader, &mut writer, header_len + *child_header.size)?;
-                _cluster_count += 1;
+                let mut raw = vec![0u8; total_size];
+                reader.read_exact(&mut raw)?;
+
+                // Extract the cluster timestamp from the raw bytes
+                // The cluster body starts after the cluster header (ID + size bytes)
+                // We need to find the Timestamp element within it
+                let cluster_body_start = header_len as usize;
+                let cluster_body = &raw[cluster_body_start..];
+                let ts = extract_cluster_timestamp_from_bytes(cluster_body);
+
+                all_clusters.push(MergeCluster::Existing(ExistingCluster {
+                    timestamp: ts,
+                    raw_header_and_body: raw,
+                }));
             }
             _ => {
-                // Non-cluster element (Tags, Cues, SeekHead, etc.) — skip it
-                // We write our own Tags at the end
+                // Non-cluster element — skip it
                 copy_n_bytes(&mut reader, &mut std::io::sink(), *child_header.size)?;
             }
         }
     }
 
-    // Append subtitle clusters
-    for cluster in &subtitle_clusters {
-        cluster.write_to(&mut writer)?;
+    // Encode subtitle clusters and add them to the merge list
+    for cluster in subtitle_clusters {
+        let ts = *cluster.timestamp;
+        all_clusters.push(MergeCluster::Subtitle(SubtitleCluster {
+            timestamp: ts,
+            encoded: cluster,
+        }));
+    }
+
+    // Sort all clusters by timestamp
+    all_clusters.sort_by_key(|c| c.timestamp());
+
+    // Write clusters in timestamp order
+    let mut _cluster_count: u64 = 0;
+    for cluster in &all_clusters {
+        match cluster {
+            MergeCluster::Existing(c) => {
+                writer.write_all(&c.raw_header_and_body)?;
+            }
+            MergeCluster::Subtitle(c) => {
+                c.encoded.write_to(&mut writer)?;
+            }
+        }
         _cluster_count += 1;
     }
 
@@ -2067,6 +2133,62 @@ fn cmd_add(
     println!("Output: {}", display_path.display());
 
     Ok(())
+}
+
+/// Extract the Timestamp value from raw cluster body bytes.
+/// The cluster body is the bytes after the cluster header (ID + size).
+/// Scans for the Timestamp element (ID 0xE7) and reads its value.
+fn extract_cluster_timestamp_from_bytes(body: &[u8]) -> u64 {
+    let mut pos = 0;
+    while pos < body.len() {
+        // Try to parse an element header
+        if body[pos] == 0 {
+            pos += 1;
+            continue;
+        }
+        let leading = body[pos].leading_zeros() as usize;
+        if leading >= 8 { break; }
+        let id_len = leading + 1;
+        if pos + id_len > body.len() { break; }
+        let element_id = match parse_vint_value(&body[pos..pos + id_len]) {
+            Some(id) => id,
+            None => break,
+        };
+
+        // Parse size
+        let size_start = pos + id_len;
+        if size_start >= body.len() { break; }
+        let size_leading = body[size_start].leading_zeros() as usize;
+        if size_leading >= 8 {
+            // Unknown size — can't continue
+            break;
+        }
+        let size_len = size_leading + 1;
+        if size_start + size_len > body.len() { break; }
+        let elem_size = match parse_vint_value(&body[size_start..size_start + size_len]) {
+            Some(s) => s as usize,
+            None => break,
+        };
+
+        let data_start = size_start + size_len;
+        let data_end = data_start + elem_size;
+
+        // Timestamp element ID is 0xE7
+        if element_id == 0xE7 && data_end <= body.len() {
+            let data = &body[data_start..data_end];
+            // Timestamp is a big-endian unsigned integer
+            let mut ts: u64 = 0;
+            for &b in data {
+                ts = (ts << 8) | b as u64;
+            }
+            return ts;
+        }
+
+        // Move to next element
+        if data_end > body.len() { break; }
+        pos = data_end;
+    }
+    0 // default to 0 if not found
 }
 
 /// Encode a u64 as an EBML VInt into a buffer.
