@@ -1481,7 +1481,14 @@ fn cmd_extract(
 
         match child_header.id {
             Cluster::ID => {
-                let cluster = Cluster::read_element(&child_header, &mut full_reader)?;
+                let cluster = match Cluster::read_element(&child_header, &mut full_reader) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // Truncated or corrupt cluster — stop reading, keep what we have
+                        eprintln!("Warning: failed to read cluster at offset {} ({}), extracting partial subtitles", pos, e);
+                        break;
+                    }
+                };
                 let cluster_ts: u64 = *cluster.timestamp;
                 for frame_result in cluster.frames() {
                     let frame = match frame_result {
@@ -1514,9 +1521,15 @@ fn cmd_extract(
                 let mut remaining = size;
                 while remaining > 0 {
                     let to_read = remaining.min(discard.len());
-                    full_reader.read_exact(&mut discard[..to_read])?;
-                    remaining -= to_read;
+                    match full_reader.read_exact(&mut discard[..to_read]) {
+                        Ok(()) => remaining -= to_read,
+                        Err(e) => {
+                            eprintln!("Warning: failed to skip non-cluster element at offset {} ({}), stopping", pos, e);
+                            break;
+                        }
+                    }
                 }
+                if remaining > 0 { break; } // outer loop break if inner broke
             }
         }
     }

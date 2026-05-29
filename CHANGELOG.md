@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.6] - 2026-05-29
+
+### Fixed
+
+- **`extract` command no longer crashes on truncated MKV files** — if a cluster or element size extends beyond the actual file (common with incomplete downloads or improperly finalized files), the command now prints a warning and extracts all subtitles found up to that point instead of failing with `failed to fill whole buffer`
+
 ## [0.2.5] - 2026-05-23
 
 ### Changed
