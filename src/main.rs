@@ -79,6 +79,84 @@ fn track_number_from_block(data: &[u8]) -> Option<u64> {
     parse_vint_value(data)
 }
 
+/// Parse the block header: extract the relative timestamp, the offset where
+/// the actual frame data begins (after track VInt + i16 relative_ts + u8 flags),
+/// and the flags byte.
+/// Returns (relative_timestamp, data_offset, flags).
+fn parse_block_header_ex(data: &[u8]) -> (i16, usize, u8) {
+    // Parse the track number VInt to find where it ends
+    if data.is_empty() {
+        return (0, 0, 0);
+    }
+    let first = data[0];
+    if first == 0 {
+        return (0, 0, 0);
+    }
+    let leading_zeros = first.leading_zeros() as usize;
+    if leading_zeros >= 8 {
+        return (0, 0, 0);
+    }
+    let vint_len = leading_zeros + 1;
+    // After track VInt: i16 relative timestamp, then u8 flags
+    let ts_offset = vint_len;
+    if data.len() < ts_offset + 3 {
+        return (0, 0, 0);
+    }
+    let rel_ts = i16::from_be_bytes([data[ts_offset], data[ts_offset + 1]]);
+    let flags = data[ts_offset + 2];
+    let data_offset = ts_offset + 2 + 1; // +1 for flags byte
+    (rel_ts, data_offset, flags)
+}
+
+/// Delace frames from a laced block body (after the block header).
+/// `lacing` is the 2-bit lacing mode from the flags byte.
+/// Returns individual frame data vectors.
+fn delace_frames(data: &[u8], lacing: u8) -> Result<Vec<Vec<u8>>> {
+    use mkv_element::Lacer;
+    let lacer = match lacing {
+        0b01 => Lacer::Xiph,
+        0b11 => Lacer::Ebml,
+        0b10 => Lacer::FixedSize,
+        _ => bail!("Unknown lacing mode: {}", lacing),
+    };
+    let delaced = lacer.delace(data)?;
+    Ok(delaced.into_iter().map(|s| s.to_vec()).collect())
+}
+
+/// Read exactly `n` bytes from the reader, returning None on any error
+/// (including truncated files).
+fn read_bytes_fallible<R: Read>(reader: &mut R, n: usize) -> Option<Vec<u8>> {
+    if n == 0 {
+        return Some(Vec::new());
+    }
+    let mut buf = vec![0u8; n];
+    match reader.read_exact(&mut buf) {
+        Ok(()) => Some(buf),
+        Err(_) => None,
+    }
+}
+
+/// Skip `n` bytes from the reader, tolerating truncation.
+fn skip_bytes<R: Read + Seek>(reader: &mut R, n: usize) {
+    if n == 0 {
+        return;
+    }
+    // Try seek first (fast), fall back to read-and-discard
+    if reader.seek(SeekFrom::Current(n as i64)).is_ok() {
+        return;
+    }
+    // Seek failed (maybe not seekable) — read and discard
+    let mut discard = vec![0u8; 8192.min(n)];
+    let mut remaining = n;
+    while remaining > 0 {
+        let to_read = remaining.min(discard.len());
+        if reader.read_exact(&mut discard[..to_read]).is_err() {
+            break;
+        }
+        remaining -= to_read;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TrackInfo — resolved from TrackEntry
 // ---------------------------------------------------------------------------
@@ -1459,20 +1537,28 @@ fn cmd_extract(
 
     let timestamp_scale: u64 = *seg_view.info.timestamp_scale;
 
-    // Now read the full MKV to get cluster data
+    // Now stream the MKV to extract subtitle frames
+    // Unlike Cluster::read_element (which loads the entire cluster body into memory
+    // including video/audio data), we parse cluster children one at a time and
+    // only keep subtitle block data. Peak RAM stays bounded by a single block.
     let mut full_reader = BufReader::new(File::open(input)?);
-    let _ebml_header = Header::read_from(&mut full_reader)?; // skip EBML
+    let _ebml = Ebml::read_from(&mut full_reader)?; // read full EBML header + body
     let segment_header = Header::read_from(&mut full_reader)?;
     let segment_data_start = full_reader.stream_position()?;
     let segment_size = if segment_header.size.is_unknown { u64::MAX } else { *segment_header.size };
     let segment_end = if segment_size == u64::MAX { u64::MAX } else { segment_data_start + segment_size };
 
-    // Collect subtitle frames per track
+    // Collect subtitle frames per track: (ts_ms, duration_ms, data)
     let mut track_frames: std::collections::HashMap<u64, Vec<(u64, Option<u64>, Vec<u8>)>> =
         std::collections::HashMap::new();
     for t in &target_tracks {
         track_frames.insert(t.number, Vec::new());
     }
+
+    // EBML element IDs for cluster children (VInt64 values)
+    let cluster_timestamp_id = Timestamp::ID;
+    let simple_block_id = SimpleBlock::ID;
+    let block_group_id = BlockGroup::ID;
 
     loop {
         let pos = full_reader.stream_position()?;
@@ -1481,55 +1567,135 @@ fn cmd_extract(
 
         match child_header.id {
             Cluster::ID => {
-                let cluster = match Cluster::read_element(&child_header, &mut full_reader) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        // Truncated or corrupt cluster — stop reading, keep what we have
-                        eprintln!("Warning: failed to read cluster at offset {} ({}), extracting partial subtitles", pos, e);
-                        break;
-                    }
+                // Streaming cluster parsing: read children one at a time
+                let cluster_body_start = full_reader.stream_position()?;
+                let cluster_body_end = if *child_header.size == u64::MAX {
+                    segment_end
+                } else {
+                    cluster_body_start + *child_header.size
                 };
-                let cluster_ts: u64 = *cluster.timestamp;
-                for frame_result in cluster.frames() {
-                    let frame = match frame_result {
-                        Ok(f) => f,
-                        Err(_) => continue,
-                    };
-                    if let Some(frames_vec) = track_frames.get_mut(&frame.track_number) {
-                        // Convert timestamp to milliseconds
-                        let ts_ms = (cluster_ts as i64 + frame.timestamp) as u64
-                            * timestamp_scale / 1_000_000;
-                        let duration_ms = frame.duration.map(|d| d.get() * timestamp_scale / 1_000_000);
 
-                        // Collect frame data
-                        let data_slices: Vec<&[u8]> = match &frame.data {
-                            mkv_element::FrameData::Single(d) => vec![d],
-                            mkv_element::FrameData::Multiple(v) => v.clone(),
-                        };
+                let mut cluster_ts: Option<u64> = None;
 
-                        for data in data_slices {
-                            let _text = String::from_utf8_lossy(data).into_owned();
-                            // For SRT, each "frame" becomes one entry
-                            frames_vec.push((ts_ms, duration_ms, data.to_vec()));
+                loop {
+                    let cpos = full_reader.stream_position()?;
+                    if cpos >= cluster_body_end { break; }
+
+                    let Ok(elem_header) = Header::read_from(&mut full_reader) else { break; };
+                    let elem_size = *elem_header.size as usize;
+
+                    match elem_header.id {
+                        id if id == cluster_timestamp_id => {
+                            // Timestamp is small — read and decode it
+                            let mut ts_buf = vec![0u8; elem_size];
+                            match full_reader.read_exact(&mut ts_buf) {
+                                Ok(()) => {
+                                    if let Ok(ts) = Timestamp::decode_body(&mut &ts_buf[..]) {
+                                        cluster_ts = Some(*ts);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Warning: failed to read cluster timestamp at offset {} ({}), skipping cluster", cpos, e);
+                                    break;
+                                }
+                            };
+                        }
+                        id if id == simple_block_id => {
+                            // Read the block body
+                            let block_buf = match read_bytes_fallible(&mut full_reader, elem_size) {
+                                Some(b) => b,
+                                None => {
+                                    eprintln!("Warning: failed to read SimpleBlock at offset {} ({} bytes), stopping cluster", cpos, elem_size);
+                                    break;
+                                }
+                            };
+
+                            // Extract track number from the first bytes
+                            if let Some(track_num) = track_number_from_block(&block_buf) {
+                                if let Some(frames_vec) = track_frames.get_mut(&track_num) {
+                                    let ts = cluster_ts.unwrap_or(0);
+                                    let (rel_ts, data_offset, flags) = parse_block_header_ex(&block_buf);
+                                    let ts_ms = ((ts as i64 + rel_ts as i64) as u64)
+                                        * timestamp_scale / 1_000_000;
+                                    if data_offset < block_buf.len() {
+                                        let lacing = (flags >> 1) & 0x03;
+                                        let frame_data = &block_buf[data_offset..];
+                                        if lacing == 0 {
+                                            // No lacing — single frame
+                                            frames_vec.push((ts_ms, None, frame_data.to_vec()));
+                                        } else {
+                                            // Laced frames — delace them
+                                            // Use mkv-element's Lacer for correct delacing
+                                            match delace_frames(frame_data, lacing) {
+                                                Ok(frames) => {
+                                                    for data in frames {
+                                                        frames_vec.push((ts_ms, None, data));
+                                                    }
+                                                }
+                                                Err(_) => {
+                                                    // Fallback: treat as single frame
+                                                    frames_vec.push((ts_ms, None, frame_data.to_vec()));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        id if id == block_group_id => {
+                            // BlockGroup — need to decode it to get BlockDuration
+                            // BlockGroups for subtitles are usually small
+                            let bg_buf = match read_bytes_fallible(&mut full_reader, elem_size) {
+                                Some(b) => b,
+                                None => {
+                                    eprintln!("Warning: failed to read BlockGroup at offset {} ({} bytes), stopping cluster", cpos, elem_size);
+                                    break;
+                                }
+                            };
+
+                            // Decode the BlockGroup
+                            if let Ok(bg) = BlockGroup::decode_body(&mut &bg_buf[..]) {
+                                let block = &bg.block;
+                                if let Some(track_num) = track_number_from_block(block) {
+                                    if let Some(frames_vec) = track_frames.get_mut(&track_num) {
+                                        let ts = cluster_ts.unwrap_or(0);
+                                        let (rel_ts, data_offset, flags) = parse_block_header_ex(block);
+                                        let ts_ms = ((ts as i64 + rel_ts as i64) as u64)
+                                            * timestamp_scale / 1_000_000;
+                                        let duration_ms = bg.block_duration
+                                            .map(|d| *d * timestamp_scale / 1_000_000);
+                                        if data_offset < block.len() {
+                                            let lacing = (flags >> 1) & 0x03;
+                                            let frame_data = &block[data_offset..];
+                                            if lacing == 0 {
+                                                frames_vec.push((ts_ms, duration_ms, frame_data.to_vec()));
+                                            } else {
+                                                match delace_frames(frame_data, lacing) {
+                                                    Ok(frames) => {
+                                                        for data in frames {
+                                                            frames_vec.push((ts_ms, duration_ms, data));
+                                                        }
+                                                    }
+                                                    Err(_) => {
+                                                        frames_vec.push((ts_ms, duration_ms, frame_data.to_vec()));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            // Skip unknown/irrelevant cluster child elements
+                            skip_bytes(&mut full_reader, elem_size);
                         }
                     }
                 }
             }
             _ => {
-                let size = *child_header.size as usize;
-                let mut discard = vec![0u8; 8192.min(size)];
-                let mut remaining = size;
-                while remaining > 0 {
-                    let to_read = remaining.min(discard.len());
-                    match full_reader.read_exact(&mut discard[..to_read]) {
-                        Ok(()) => remaining -= to_read,
-                        Err(e) => {
-                            eprintln!("Warning: failed to skip non-cluster element at offset {} ({}), stopping", pos, e);
-                            break;
-                        }
-                    }
-                }
-                if remaining > 0 { break; } // outer loop break if inner broke
+                // Non-cluster segment child (Tags, Cues, etc.) — skip entirely
+                skip_bytes(&mut full_reader, *child_header.size as usize);
             }
         }
     }

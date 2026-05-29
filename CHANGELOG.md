@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [0.2.6] - 2026-05-29
 
+### Changed
+
+- **`extract` command now uses streaming I/O** — peak RAM is bounded by a single subtitle block (~a few KB) instead of loading entire clusters (video+audio+subtitles) into memory. For a 10 GB 1080p MKV with subtitles, peak RAM drops from potentially hundreds of MB to ~1 MB.
+  - Only subtitle block data is read into memory; video and audio blocks are skipped via seek
+  - Handles laced subtitle frames correctly (Xiph, EBML, fixed-size lacing)
+  - BlockGroups are decoded for proper BlockDuration extraction
+
 ### Fixed
 
 - **`extract` command no longer crashes on truncated MKV files** — if a cluster or element size extends beyond the actual file (common with incomplete downloads or improperly finalized files), the command now prints a warning and extracts all subtitles found up to that point instead of failing with `failed to fill whole buffer`
