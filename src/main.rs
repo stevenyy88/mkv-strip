@@ -32,6 +32,26 @@ const EBML_ID_FLAG_ORIGINAL: u64 = 0x15AE;    // FlagOriginal
 const EBML_ID_FLAG_COMMENTARY: u64 = 0x15AF;  // FlagCommentary
 const EBML_ID_TRACK_NUMBER: u64 = 0x57;       // TrackNumber: encoded 0xD7, decoded 0x57
 
+/// Sanitize a filename string for cross-platform compatibility.
+/// Removes or replaces characters that are invalid on Windows.
+fn sanitize_filename(s: &str) -> String {
+    // Windows forbids: < > : " / \ | ? *
+    // Also strip control characters and trailing dots/spaces (Windows doesn't like them)
+    let result = s
+        .replace('<', "")
+        .replace('>', "")
+        .replace(':', "-")
+        .replace('"', "'")
+        .replace('/', "-")
+        .replace('\\', "-")
+        .replace('|', "-")
+        .replace('?', "")
+        .replace('*', "");
+    // Trim trailing dots and spaces (Windows doesn't allow them)
+    let trimmed = result.trim_end_matches(|c| c == '.' || c == ' ');
+    trimmed.to_string()
+}
+
 fn track_type_name(tt: u64) -> &'static str {
     match tt {
         TRACK_TYPE_VIDEO => "video",
@@ -1527,7 +1547,10 @@ fn cmd_extract(
     // Determine output directory
     let out_dir = match output_dir {
         Some(d) => d.clone(),
-        None => input.parent().unwrap_or(std::path::Path::new(".")).to_path_buf(),
+        None => input.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf(),
     };
     std::fs::create_dir_all(&out_dir)?;
 
@@ -1708,9 +1731,9 @@ fn cmd_extract(
             continue;
         }
 
-        let lang_suffix = if track.language != "und" { &track.language } else { "" };
-        let name_suffix = track.name.as_deref().map(|n| format!(".{}", n.replace(' ', "_"))).unwrap_or_default();
-        let srt_filename = format!("{}.{}.{}{}.srt", base_name, track.number, lang_suffix, name_suffix);
+        let lang_suffix = sanitize_filename(if track.language != "und" { track.language.as_str() } else { "" });
+        let name_suffix = track.name.as_deref().map(|n| format!(".{}", sanitize_filename(&n.replace(' ', "_")))).unwrap_or_default();
+        let srt_filename = format!("{}.{}.{}{}.srt", sanitize_filename(base_name), track.number, lang_suffix, name_suffix);
         let srt_path = out_dir.join(&srt_filename);
 
         let mut srt_content = String::new();
