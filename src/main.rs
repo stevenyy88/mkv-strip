@@ -365,38 +365,70 @@ impl SrtEntry {
 /// Parse an SRT file into entries.
 fn parse_srt(content: &str) -> Result<Vec<SrtEntry>> {
     let mut entries = Vec::new();
-    // Split on blank lines (each subtitle block is separated by one or more blank lines)
-    let _blocks: Vec<&str> = content.split("\n\r\n").collect();
-    // Also handle \n\n without \r
-    let blocks: Vec<&str> = content
-        .split("\n\n")
-        .flat_map(|b| b.split("\r\n\r\n"))
-        .collect();
 
-    for block in blocks {
-        let block = block.trim();
-        if block.is_empty() {
+    // Normalize line endings and split into lines
+    let content = content.replace("\r\n", "\n").replace("\r", "\n");
+    let lines: Vec<&str> = content.lines().collect();
+
+    // Scan for entry boundaries: a line that's just a number (entry index),
+    // followed by a timestamp line containing "-->".
+    // This handles both standard SRT (blank-line separated) and
+    // single-newline-separated SRT files.
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim();
+
+        // Skip blank lines
+        if line.is_empty() {
+            i += 1;
             continue;
         }
-        let lines: Vec<&str> = block.lines().collect();
-        if lines.len() < 3 {
-            continue; // Need at least: index, timestamp, text
-        }
 
-        // Parse index
-        let index: u32 = lines[0].trim().parse().unwrap_or(entries.len() as u32 + 1);
+        // Try to parse this as an entry index (a number)
+        let index: u32 = match line.parse() {
+            Ok(n) => n,
+            Err(_) => { i += 1; continue; }
+        };
 
-        // Parse timestamp line: "00:00:20,000 --> 00:00:24,400"
-        let ts_line = lines[1].trim();
+        // Next line should be the timestamp
+        if i + 1 >= lines.len() { break; }
+        let ts_line = lines[i + 1].trim();
         let ts_parts: Vec<&str> = ts_line.split("-->").collect();
         if ts_parts.len() != 2 {
+            i += 1;
             continue;
         }
-        let start_ms = parse_srt_timestamp(ts_parts[0].trim())?;
-        let end_ms = parse_srt_timestamp(ts_parts[1].trim())?;
 
-        // Text is everything from line 2 onward
-        let text = lines[2..].join("\n");
+        let start_ms = match parse_srt_timestamp(ts_parts[0].trim()) {
+            Ok(v) => v,
+            Err(_) => { i += 1; continue; }
+        };
+        let end_ms = match parse_srt_timestamp(ts_parts[1].trim()) {
+            Ok(v) => v,
+            Err(_) => { i += 1; continue; }
+        };
+
+        // Collect text lines until we hit the next entry (a line that's just a number
+        // followed by a timestamp line) or EOF
+        let mut text_lines: Vec<&str> = Vec::new();
+        let mut j = i + 2;
+        while j < lines.len() {
+            let candidate = lines[j].trim();
+            // Check if this line is the start of a new entry:
+            // it's a number AND the next line is a timestamp
+            if !candidate.is_empty() {
+                if candidate.parse::<u32>().is_ok() && j + 1 < lines.len() {
+                    let next_ts = lines[j + 1].trim();
+                    if next_ts.contains("-->") {
+                        break;
+                    }
+                }
+                text_lines.push(lines[j]);
+            }
+            j += 1;
+        }
+
+        let text = text_lines.join("\n");
 
         entries.push(SrtEntry {
             index,
@@ -404,6 +436,8 @@ fn parse_srt(content: &str) -> Result<Vec<SrtEntry>> {
             end_ms,
             text,
         });
+
+        i = j;
     }
 
     Ok(entries)
