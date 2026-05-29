@@ -1896,7 +1896,25 @@ fn cmd_add(
     });
     updated_tracks.track_entry.push(new_track_entry);
 
-    // Build subtitle clusters from SRT entries
+    // Build subtitle clusters from SRT entries.
+    //
+    // Key constraints:
+    // - Block relative timestamps are i16 (max ±32,767 ticks)
+    // - timestamp_scale converts between ticks and real time
+    // - We split into new clusters when the gap between subtitles is large
+    //   enough that the relative timestamp would overflow i16.
+    //
+    // Strategy: work in ticks throughout. The safe relative_ts range is
+    // i16::MIN..=i16::MAX (-32768..32767). We split clusters when the
+    // next entry would exceed this range from the cluster timestamp.
+    // We also split on large time gaps (>30 seconds real time) to keep
+    // clusters reasonably sized.
+    // The relative timestamp within a block is i16 (max 32767 ticks).
+    // We must split into a new cluster whenever the next subtitle's timestamp
+    // would overflow i16 relative to the current cluster's timestamp.
+    // Use 90% of i16 max as the safe limit to leave headroom.
+    let max_cluster_span: u64 = (i16::MAX as u64) * 90 / 100; // ~29490 ticks
+
     let mut subtitle_clusters: Vec<Cluster> = Vec::new();
     let mut current_blocks: Vec<ClusterBlock> = Vec::new();
     let mut current_cluster_ts: u64 = 0;
@@ -1906,8 +1924,11 @@ fn cmd_add(
 
         if current_blocks.is_empty() {
             current_cluster_ts = start_ticks;
-        } else if (start_ticks as i64 - current_cluster_ts as i64).unsigned_abs() > 30000 {
-            if !current_blocks.is_empty() {
+        } else {
+            // Would this entry's relative timestamp overflow i16?
+            let span = (start_ticks as i64 - current_cluster_ts as i64).unsigned_abs();
+            if span > max_cluster_span {
+                // Yes — flush current cluster and start a new one at this timestamp
                 subtitle_clusters.push(Cluster {
                     crc32: None,
                     void: None,
@@ -1916,8 +1937,8 @@ fn cmd_add(
                     prev_size: None,
                     blocks: std::mem::take(&mut current_blocks),
                 });
+                current_cluster_ts = start_ticks;
             }
-            current_cluster_ts = start_ticks;
         }
 
         let text_bytes = entry.text.as_bytes();
@@ -1953,6 +1974,16 @@ fn cmd_add(
             prev_size: None,
             blocks: current_blocks,
         });
+    }
+
+    println!("Subtitle clusters: {} (timestamp_scale={}, max_cluster_span={} ticks)",
+        subtitle_clusters.len(), timestamp_scale, (i16::MAX as u64) * 90 / 100);
+    for (i, sc) in subtitle_clusters.iter().enumerate().take(5) {
+        let block_count = sc.blocks.len();
+        println!("  Cluster {}: ts={}, blocks={}", i, *sc.timestamp, block_count);
+    }
+    if subtitle_clusters.len() > 5 {
+        println!("  ... ({} more)", subtitle_clusters.len() - 5);
     }
 
     // Determine output path — when overwriting input, use a temp file first
