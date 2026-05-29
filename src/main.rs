@@ -2076,6 +2076,11 @@ fn cmd_add(
     // Sort all clusters by timestamp
     all_clusters.sort_by_key(|c| c.timestamp());
 
+    let existing_count = all_clusters.iter().filter(|c| matches!(c, MergeCluster::Existing(_))).count();
+    let subtitle_count = all_clusters.iter().filter(|c| matches!(c, MergeCluster::Subtitle(_))).count();
+    println!("Merged {} existing + {} subtitle clusters ({} total)",
+        existing_count, subtitle_count, all_clusters.len());
+
     // Write clusters in timestamp order
     let mut _cluster_count: u64 = 0;
     for cluster in &all_clusters {
@@ -2173,8 +2178,8 @@ fn extract_cluster_timestamp_from_bytes(body: &[u8]) -> u64 {
         let data_start = size_start + size_len;
         let data_end = data_start + elem_size;
 
-        // Timestamp element ID is 0xE7
-        if element_id == 0xE7 && data_end <= body.len() {
+        // Timestamp element ID: encoded 0xE7, decoded by parse_vint_value -> 0x67
+        if element_id == 0x67 && data_end <= body.len() {
             let data = &body[data_start..data_end];
             // Timestamp is a big-endian unsigned integer
             let mut ts: u64 = 0;
