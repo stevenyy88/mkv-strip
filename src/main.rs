@@ -1772,14 +1772,20 @@ fn cmd_add(
 
     println!("Loaded {} subtitle(s) from {}", srt_entries.len(), srt_path.display());
 
-    // Read the full MKV
-    let mut mkv_data = read_full_mkv(input)?;
+    // Read metadata using MatroskaView (lightweight — no clusters loaded)
+    let mut meta_reader = BufReader::new(File::open(input)?);
+    let view = MatroskaView::new(&mut meta_reader)
+        .with_context(|| format!("Failed to parse MKV metadata from {}", input.display()))?;
+
+    if view.segments.len() != 1 {
+        bail!("Multi-segment files are not yet supported.");
+    }
+
+    let seg_view = &view.segments[0];
+    let tracks = seg_view.tracks.as_ref().context("No Tracks element found")?;
 
     // Determine the next track number
-    let max_track_num = mkv_data.tracks
-        .as_ref()
-        .map(|t| t.track_entry.iter().map(|te| *te.track_number).max().unwrap_or(0))
-        .unwrap_or(0);
+    let max_track_num = tracks.track_entry.iter().map(|te| *te.track_number).max().unwrap_or(0);
     let new_track_number = max_track_num + 1;
 
     // Generate a unique TrackUID
@@ -1788,67 +1794,9 @@ fn cmd_add(
         .as_millis() as u64;
 
     // Get timestamp scale from Info
-    let timestamp_scale: u64 = *mkv_data.info.timestamp_scale;
+    let timestamp_scale: u64 = *seg_view.info.timestamp_scale;
 
-    // Convert SRT entries to MKV Cluster blocks
-    // Group frames into clusters by time proximity (every ~5 seconds or on gap)
-    let mut clusters_to_add: Vec<Cluster> = Vec::new();
-    let mut current_blocks: Vec<ClusterBlock> = Vec::new();
-    let mut current_cluster_ts: u64 = 0;
-
-    for entry in &srt_entries {
-        // Convert ms to segment ticks
-        let start_ticks = entry.start_ms * 1_000_000 / timestamp_scale;
-
-        // Start a new cluster if the timestamp gap is large or this is the first entry
-        if current_blocks.is_empty() {
-            current_cluster_ts = start_ticks;
-        } else if (start_ticks as i64 - current_cluster_ts as i64).unsigned_abs() > 30000 {
-            // Gap > 30s of ticks, start new cluster
-            if !current_blocks.is_empty() {
-                clusters_to_add.push(Cluster {
-                    crc32: None,
-                    void: None,
-                    timestamp: Timestamp(current_cluster_ts),
-                    position: None,
-                    prev_size: None,
-                    blocks: std::mem::take(&mut current_blocks),
-                });
-            }
-            current_cluster_ts = start_ticks;
-        }
-
-        // Build the SimpleBlock for this subtitle frame
-        // SimpleBlock format: [track_number_vint] [relative_ts i16] [flags u8] [data]
-        let text_bytes = entry.text.as_bytes();
-        let relative_ts = (start_ticks as i64 - current_cluster_ts as i64) as i16;
-
-        let mut block_data = Vec::new();
-        // Encode track number as VInt
-        encode_vint(new_track_number, &mut block_data);
-        // Relative timestamp (i16 big-endian)
-        block_data.extend_from_slice(&relative_ts.to_be_bytes());
-        // Flags: keyframe bit (0x80) set for subtitle frames
-        block_data.push(0x80);
-        // Frame data
-        block_data.extend_from_slice(text_bytes);
-
-        current_blocks.push(ClusterBlock::Simple(SimpleBlock(Bytes::from(block_data))));
-    }
-
-    // Flush remaining blocks
-    if !current_blocks.is_empty() {
-        clusters_to_add.push(Cluster {
-            crc32: None,
-            void: None,
-            timestamp: Timestamp(current_cluster_ts),
-            position: None,
-            prev_size: None,
-            blocks: current_blocks,
-        });
-    }
-
-    // Add the new track entry
+    // Build the new track entry
     let new_track_entry = TrackEntry {
         crc32: None,
         void: None,
@@ -1883,23 +1831,145 @@ fn cmd_add(
         content_encodings: None,
     };
 
-    // Ensure tracks exist and add the entry
-    if mkv_data.tracks.is_none() {
-        mkv_data.tracks = Some(Tracks {
+    // Build updated Tracks element with the new track entry
+    let mut updated_tracks = seg_view.tracks.clone().unwrap_or_else(|| Tracks {
+        crc32: None,
+        void: None,
+        track_entry: vec![],
+    });
+    updated_tracks.track_entry.push(new_track_entry);
+
+    // Build subtitle clusters from SRT entries
+    let mut subtitle_clusters: Vec<Cluster> = Vec::new();
+    let mut current_blocks: Vec<ClusterBlock> = Vec::new();
+    let mut current_cluster_ts: u64 = 0;
+
+    for entry in &srt_entries {
+        let start_ticks = entry.start_ms * 1_000_000 / timestamp_scale;
+
+        if current_blocks.is_empty() {
+            current_cluster_ts = start_ticks;
+        } else if (start_ticks as i64 - current_cluster_ts as i64).unsigned_abs() > 30000 {
+            if !current_blocks.is_empty() {
+                subtitle_clusters.push(Cluster {
+                    crc32: None,
+                    void: None,
+                    timestamp: Timestamp(current_cluster_ts),
+                    position: None,
+                    prev_size: None,
+                    blocks: std::mem::take(&mut current_blocks),
+                });
+            }
+            current_cluster_ts = start_ticks;
+        }
+
+        let text_bytes = entry.text.as_bytes();
+        let relative_ts = (start_ticks as i64 - current_cluster_ts as i64) as i16;
+
+        let mut block_data = Vec::new();
+        encode_vint(new_track_number, &mut block_data);
+        block_data.extend_from_slice(&relative_ts.to_be_bytes());
+        block_data.push(0x80); // keyframe flag
+        block_data.extend_from_slice(text_bytes);
+
+        current_blocks.push(ClusterBlock::Simple(SimpleBlock(Bytes::from(block_data))));
+    }
+
+    if !current_blocks.is_empty() {
+        subtitle_clusters.push(Cluster {
             crc32: None,
             void: None,
-            track_entry: vec![],
+            timestamp: Timestamp(current_cluster_ts),
+            position: None,
+            prev_size: None,
+            blocks: current_blocks,
         });
     }
-    mkv_data.tracks.as_mut().unwrap().track_entry.push(new_track_entry);
-
-    // Append clusters
-    mkv_data.clusters.extend(clusters_to_add);
 
     // Determine output path
     let output_path = output.clone().unwrap_or_else(|| input.clone());
 
-    write_mkv(&output_path, &mkv_data)?;
+    // Stream the MKV: copy all existing clusters, append subtitle clusters
+    let out_file = File::create(&output_path)
+        .with_context(|| format!("Failed to create output file {}", output_path.display()))?;
+    let mut writer = BufWriter::new(out_file);
+    let mut reader = BufReader::new(File::open(input)?);
+
+    // Read and write EBML header
+    let ebml = Ebml::read_from(&mut reader)?;
+    let segment_header = Header::read_from(&mut reader)?;
+    if segment_header.id != Segment::ID {
+        bail!("Expected Segment element, got {}", segment_header.id);
+    }
+    let segment_data_start = reader.stream_position()?;
+
+    ebml.write_to(&mut writer)?;
+    // Write Segment header with 8-byte placeholder for size
+    writer.write_all(&[0x18, 0x53, 0x80, 0x67])?; // Segment ID
+    let size_offset = writer.stream_position()?;
+    writer.write_all(&[0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])?; // 8-byte placeholder
+    let content_start = writer.stream_position()?;
+
+    // Write metadata (Info, updated Tracks, Attachments, Chapters)
+    seg_view.info.write_to(&mut writer)?;
+    updated_tracks.write_to(&mut writer)?;
+    if let Some(ref attachments) = seg_view.attachments {
+        attachments.write_to(&mut writer)?;
+    }
+    if let Some(ref chapters) = seg_view.chapters {
+        chapters.write_to(&mut writer)?;
+    }
+
+    // Stream-copy all existing clusters from input
+    let segment_size = if segment_header.size.is_unknown { u64::MAX } else { *segment_header.size };
+    let segment_end = if segment_size == u64::MAX { u64::MAX } else { segment_data_start + segment_size };
+
+    reader.seek(SeekFrom::Start(segment_data_start))?;
+    let mut _cluster_count: u64 = 0;
+
+    loop {
+        let pos = reader.stream_position()?;
+        if pos >= segment_end { break; }
+        let Ok(child_header) = Header::read_from(&mut reader) else { break; };
+        let header_len = reader.stream_position()? - pos;
+
+        match child_header.id {
+            Cluster::ID => {
+                // Raw copy the entire cluster (header + body) — no decode needed
+                reader.seek(SeekFrom::Start(pos))?;
+                copy_n_bytes(&mut reader, &mut writer, header_len + *child_header.size)?;
+                _cluster_count += 1;
+            }
+            _ => {
+                // Non-cluster element (Tags, Cues, SeekHead, etc.) — skip it
+                // We write our own Tags at the end
+                copy_n_bytes(&mut reader, &mut std::io::sink(), *child_header.size)?;
+            }
+        }
+    }
+
+    // Append subtitle clusters
+    for cluster in &subtitle_clusters {
+        cluster.write_to(&mut writer)?;
+        _cluster_count += 1;
+    }
+
+    // Write Tags (copy from original, unchanged)
+    for tag in seg_view.tags.iter() {
+        tag.write_to(&mut writer)?;
+    }
+
+    // Patch Segment size
+    let content_end = writer.stream_position()?;
+    let content_size = content_end - content_start;
+    let size_bytes = encode_vint_size(content_size);
+    writer.seek(SeekFrom::Start(size_offset))?;
+    writer.write_all(&size_bytes)?;
+    let gap = 8 - size_bytes.len();
+    write_void_fill(&mut writer, gap)?;
+
+    writer.seek(SeekFrom::End(0))?;
+    writer.flush()?;
 
     println!();
     println!(

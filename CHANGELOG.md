@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.7] - 2026-05-29
+
+### Changed
+
+- **`add` command now uses streaming I/O** — existing clusters are raw-copied from input to output without decoding/re-encoding, then subtitle clusters are appended. Peak RAM drops from 2× file size (full decode + re-encode) to ~1 MB (bounded by subtitle cluster size).
+  - Video/audio clusters: zero-copy passthrough (seek + 64KB buffer)
+  - New subtitle clusters: built from SRT entries and written directly
+  - Metadata (Info, Tracks, Attachments, Chapters): rewritten from MatroskaView with updated track entry
+  - Tags: preserved from original
+
 ## [0.2.6] - 2026-05-29
 
 ### Changed
