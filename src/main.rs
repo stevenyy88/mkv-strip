@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, CommandFactory};
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -2112,19 +2112,78 @@ fn cmd_add(
     println!("Merged {} existing + {} subtitle clusters ({} total)",
         existing_count, subtitle_count, all_clusters.len());
 
-    // Write clusters in timestamp order
+    // Write clusters in timestamp order, tracking positions for Cues
+    // cue_entries: map of (track_number, timestamp) -> cluster_position
+    let mut cue_entries: Vec<(u64, u64, u64)> = Vec::new(); // (track_num, timestamp, cluster_pos)
     let mut _cluster_count: u64 = 0;
+
     for cluster in &all_clusters {
+        let cluster_pos = writer.stream_position()? - content_start; // position relative to Segment data start
+        let ts = cluster.timestamp();
+
         match cluster {
             MergeCluster::Existing(c) => {
+                // Extract track numbers from raw cluster data for Cues
+                let cluster_body_start = extract_cluster_header_len(&c.raw_header_and_body);
+                let body = &c.raw_header_and_body[cluster_body_start..];
+                let track_nums = extract_track_numbers_from_cluster(body);
+                for tn in track_nums {
+                    cue_entries.push((tn, ts, cluster_pos));
+                }
                 writer.write_all(&c.raw_header_and_body)?;
             }
             MergeCluster::Subtitle(c) => {
+                // Subtitle cluster — we know the track number
+                cue_entries.push((new_track_number, ts, cluster_pos));
                 c.encoded.write_to(&mut writer)?;
             }
         }
         _cluster_count += 1;
     }
+
+    // Build and write Cues element for seeking
+    // Group cue entries by (track, timestamp) and keep the first occurrence
+    let mut seen: HashSet<(u64, u64)> = HashSet::new();
+    let mut cue_points_map: HashMap<u64, Vec<(u64, u64)>> = HashMap::new(); // timestamp -> [(track, pos)]
+    for (tn, ts, pos) in &cue_entries {
+        if seen.insert((*tn, *ts)) {
+            cue_points_map.entry(*ts).or_default().push((*tn, *pos));
+        }
+    }
+    let mut cue_points: Vec<CuePoint> = Vec::new();
+    let mut sorted_timestamps: Vec<u64> = cue_points_map.keys().copied().collect();
+    sorted_timestamps.sort();
+    for ts in sorted_timestamps {
+        let track_positions = cue_points_map.remove(&ts).unwrap();
+        let cue_track_positions: Vec<CueTrackPositions> = track_positions.iter()
+            .map(|(tn, pos)| CueTrackPositions {
+                crc32: None,
+                void: None,
+                cue_track: CueTrack(*tn),
+                cue_cluster_position: CueClusterPosition(*pos),
+                cue_relative_position: None,
+                cue_duration: None,
+                cue_block_number: None,
+                cue_codec_state: CueCodecState(0),
+                cue_reference: vec![],
+            })
+            .collect();
+        cue_points.push(CuePoint {
+            crc32: None,
+            void: None,
+            cue_time: CueTime(ts),
+            cue_track_positions,
+        });
+    }
+    let cues = Cues {
+        crc32: None,
+        void: None,
+        cue_point: cue_points,
+    };
+    cues.write_to(&mut writer)?;
+    println!("Wrote {} cue points for {} tracks",
+        cues.cue_point.len(),
+        cue_entries.iter().map(|(tn,_,_)| tn).collect::<HashSet<_>>().len());
 
     // Write Tags (copy from original, unchanged)
     for tag in seg_view.tags.iter() {
@@ -2225,6 +2284,108 @@ fn extract_cluster_timestamp_from_bytes(body: &[u8]) -> u64 {
         pos = data_end;
     }
     0 // default to 0 if not found
+}
+
+/// Extract the header length (ID + size bytes) of a cluster from its raw bytes.
+/// Returns the offset where the cluster body starts.
+fn extract_cluster_header_len(raw: &[u8]) -> usize {
+    if raw.is_empty() { return 0; }
+    // Cluster ID is 4 bytes (0x1F43B675)
+    let first = raw[0];
+    let leading = first.leading_zeros() as usize;
+    if leading >= 8 { return 0; }
+    let id_len = leading + 1;
+    if id_len >= raw.len() { return id_len; }
+    let size_leading = raw[id_len].leading_zeros() as usize;
+    if size_leading >= 8 { return id_len + 1; }
+    let size_len = size_leading + 1;
+    id_len + size_len
+}
+
+/// Extract all track numbers from cluster body bytes (SimpleBlock and BlockGroup).
+/// Returns a deduplicated list of track numbers found.
+fn extract_track_numbers_from_cluster(body: &[u8]) -> Vec<u64> {
+    let mut track_numbers = HashSet::new();
+    let mut pos = 0;
+    while pos < body.len() {
+        if body[pos] == 0 { pos += 1; continue; }
+        let leading = body[pos].leading_zeros() as usize;
+        if leading >= 8 { break; }
+        let id_len = leading + 1;
+        if pos + id_len > body.len() { break; }
+        let element_id = match parse_vint_value(&body[pos..pos + id_len]) {
+            Some(id) => id,
+            None => break,
+        };
+        let size_start = pos + id_len;
+        if size_start >= body.len() { break; }
+        let size_leading = body[size_start].leading_zeros() as usize;
+        if size_leading >= 8 { break; }
+        let size_len = size_leading + 1;
+        if size_start + size_len > body.len() { break; }
+        let elem_size = match parse_vint_value(&body[size_start..size_start + size_len]) {
+            Some(s) => s as usize,
+            None => break,
+        };
+        let data_start = size_start + size_len;
+        let data_end = data_start + elem_size;
+        if data_end > body.len() { break; }
+
+        // SimpleBlock (encoded 0xA3, decoded 0x23) or Block (encoded 0xA1, decoded 0x21)
+        if element_id == 0x23 || element_id == 0x21 {
+            let data = &body[data_start..data_end];
+            if let Some(tn) = track_number_from_block(data) {
+                track_numbers.insert(tn);
+            }
+        }
+        // BlockGroup (encoded 0xA0, decoded 0x20) — contains Block
+        // We don't recurse into BlockGroup here; the Block inside will be
+        // found as a separate element since we scan linearly.
+        // Actually, BlockGroup is a master element, so its children appear
+        // as separate elements in the flat scan. But they won't, because
+        // the cluster body is a flat list of top-level children.
+        // Block is a child of BlockGroup, so it appears nested.
+        // We need to handle BlockGroup specially.
+        if element_id == 0x20 { // BlockGroup decoded ID
+            let bg_data = &body[data_start..data_end];
+            let mut bg_pos = 0;
+            while bg_pos < bg_data.len() {
+                if bg_data[bg_pos] == 0 { bg_pos += 1; continue; }
+                let bg_leading = bg_data[bg_pos].leading_zeros() as usize;
+                if bg_leading >= 8 { break; }
+                let bg_id_len = bg_leading + 1;
+                if bg_pos + bg_id_len > bg_data.len() { break; }
+                let bg_elem_id = match parse_vint_value(&bg_data[bg_pos..bg_pos + bg_id_len]) {
+                    Some(id) => id,
+                    None => break,
+                };
+                let bg_size_start = bg_pos + bg_id_len;
+                if bg_size_start >= bg_data.len() { break; }
+                let bg_size_leading = bg_data[bg_size_start].leading_zeros() as usize;
+                if bg_size_leading >= 8 { break; }
+                let bg_size_len = bg_size_leading + 1;
+                if bg_size_start + bg_size_len > bg_data.len() { break; }
+                let bg_elem_size = match parse_vint_value(&bg_data[bg_size_start..bg_size_start + bg_size_len]) {
+                    Some(s) => s as usize,
+                    None => break,
+                };
+                let bg_data_start = bg_size_start + bg_size_len;
+                let bg_data_end = bg_data_start + bg_elem_size;
+                if bg_data_end > bg_data.len() { break; }
+
+                // Block (decoded 0x21)
+                if bg_elem_id == 0x21 {
+                    let block_data = &bg_data[bg_data_start..bg_data_end];
+                    if let Some(tn) = track_number_from_block(block_data) {
+                        track_numbers.insert(tn);
+                    }
+                }
+                bg_pos = bg_data_end;
+            }
+        }
+        pos = data_end;
+    }
+    track_numbers.into_iter().collect()
 }
 
 /// Encode a u64 as an EBML VInt into a buffer.
