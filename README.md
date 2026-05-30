@@ -256,12 +256,35 @@ Image-based subtitles (VobSub `S_VOBSUB`, HDMV PGS) are not supported for extrac
 - **flags** — Modifies flag bytes in-place by locating EBML element positions and overwriting only the value bytes (instant, no re-encode); falls back to full rewrite if a flag element needs to be inserted
 - **strip** — Two-pass: metadata scan first (via `MatroskaView`, lightweight), then streaming cluster processing with block-level track filtering. When all tracks are kept, clusters are raw-copied with zero decode/encode (~3 MB RAM). When some tracks are removed, clusters are parsed one at a time (~20 MB RAM peak). Can also modify track flags (default, forced, enabled).
 - **strip -k** — Same two-pass approach, but selects tracks by ID instead of language
-- **add** — Parses SRT timestamps, converts to MKV segment ticks, builds SimpleBlock elements, appends new TrackEntry + clusters
+- **add** — Parses SRT timestamps, converts to MKV segment ticks, builds SimpleBlock elements, appends new TrackEntry + clusters. Writes a **SeekHead** at the Segment start (per RFC 9559 §6.3) and deduplicated **Cues** for fast seeking.
+
+## 🧪 RFC 9559 Compliance
+
+mkv-strip is validated against the [IETF Matroska test suite](https://github.com/ietf-wg-cellar/matroska-test-files) (8 official test files) plus custom round-trip tests.
+
+Run the test suite:
+```bash
+git submodule update --init   # fetch IETF test files (one-time)
+cargo test
+```
+
+| Test | What it verifies |
+|------|------------------|
+| `test_list_all_ietf_files` | `list` parses all IETF test files (1–3, 5–6, 8) |
+| `test_strip_keep_video_audio` | Strip removes correct track types |
+| `test_strip_roundtrip_reparsable` | Stripped output is valid, re-parsable MKV |
+| `test_strip_by_language` | Language-based track filtering |
+| `test_add_srt_creates_subtitle_track` | SRT → subtitle track creation |
+| `test_add_extract_roundtrip` | Add → extract preserves subtitle text |
+| `test_add_produces_seekhead_and_cues` | SeekHead + Cues present (RFC §6.3, §22) |
+| `test_cues_deduplicated` | CuePoints sorted by time, deduplicated per cluster |
+| `test_cluster_timestamps_monotonic` | Cluster timestamps in correct order |
+| `test_flags_inplace` | In-place flag modification works |
 
 ## ⚠️ Limitations
 
 - **Memory** — Peak RAM is ~3-20 MB regardless of input file size. When all tracks are kept, clusters are raw-copied (no decode/encode). When some tracks are removed, clusters are parsed and filtered one at a time. `add`, `extract`, and `flags` commands also use minimal memory.
-- **SeekHead / Cues** — Dropped from output; most players rebuild these automatically
+- **SeekHead / Cues** — The `add` command writes SeekHead and Cues (RFC 9559 compliant). The `strip` command does **not** rewrite Cues — most players rebuild these automatically.
 - **Multi-segment files** — Not yet supported (rare in practice)
 - **Track renumbering** — Track numbers are preserved as-is
 - **Add command** — Always writes `S_TEXT/UTF8` codec; SRT positioning tags are not preserved
