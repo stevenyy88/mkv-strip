@@ -362,35 +362,31 @@ impl SrtEntry {
     }
 }
 
-/// Parse an SRT file into entries.
+/// Parse an SRT file into entries, preserving original line endings in text.
 fn parse_srt(content: &str) -> Result<Vec<SrtEntry>> {
     let mut entries = Vec::new();
 
-    // Normalize line endings and split into lines
-    let content = content.replace("\r\n", "\n").replace("\r", "\n");
-    let lines: Vec<&str> = content.lines().collect();
+    // Use split_inclusive to preserve line endings for text extraction.
+    // split_inclusive keeps the delimiter (\n) at the end of each line.
+    let raw_lines: Vec<&str> = content.split_inclusive('\n').collect();
 
-    // Scan for entry boundaries: a line that's just a number (entry index),
-    // followed by a timestamp line containing "-->".
-    // This handles both standard SRT (blank-line separated) and
-    // single-newline-separated SRT files.
+    // For parsing (index/timestamp detection), use trimmed versions
+    let lines: Vec<&str> = raw_lines.iter().map(|l| l.trim_end_matches(|c| c == '\n' || c == '\r')).collect();
+
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i].trim();
 
-        // Skip blank lines
         if line.is_empty() {
             i += 1;
             continue;
         }
 
-        // Try to parse this as an entry index (a number)
         let index: u32 = match line.parse() {
             Ok(n) => n,
             Err(_) => { i += 1; continue; }
         };
 
-        // Next line should be the timestamp
         if i + 1 >= lines.len() { break; }
         let ts_line = lines[i + 1].trim();
         let ts_parts: Vec<&str> = ts_line.split("-->").collect();
@@ -408,14 +404,11 @@ fn parse_srt(content: &str) -> Result<Vec<SrtEntry>> {
             Err(_) => { i += 1; continue; }
         };
 
-        // Collect text lines until we hit the next entry (a line that's just a number
-        // followed by a timestamp line) or EOF
-        let mut text_lines: Vec<&str> = Vec::new();
+        // Collect text lines, preserving original line endings from the raw content.
+        let mut text = String::new();
         let mut j = i + 2;
         while j < lines.len() {
             let candidate = lines[j].trim();
-            // Check if this line is the start of a new entry:
-            // it's a number AND the next line is a timestamp
             if !candidate.is_empty() {
                 if candidate.parse::<u32>().is_ok() && j + 1 < lines.len() {
                     let next_ts = lines[j + 1].trim();
@@ -423,12 +416,14 @@ fn parse_srt(content: &str) -> Result<Vec<SrtEntry>> {
                         break;
                     }
                 }
-                text_lines.push(lines[j]);
+                // Use raw_lines to preserve original line endings (\r\n or \n)
+                text.push_str(raw_lines[j]);
             }
             j += 1;
         }
-
-        let text = text_lines.join("\n");
+        // Trim trailing newlines from the text block — the Block will get
+        // a single \n appended by the add command.
+        let text = text.trim_end_matches(|c| c == '\n' || c == '\r').to_string();
 
         entries.push(SrtEntry {
             index,
@@ -2128,13 +2123,18 @@ fn cmd_add(
         }
 
         // SRT spec §3: text includes trailing newline within the MKV Block.
-        // The text itself is clean (no trailing whitespace from rectify_srt),
-        // but the Block content needs a trailing LF for proper subtitle display.
+        // Preserve original line endings (\r\n or \n) from the SRT file.
+        // Detect which line ending the original used by checking for \r\n.
         let text_bytes = if entry.text.ends_with('\n') {
             entry.text.as_bytes().to_vec()
         } else {
+            let uses_crlf = entry.text.contains("\r\n");
             let mut b = entry.text.as_bytes().to_vec();
-            b.push(b'\n');
+            if uses_crlf {
+                b.extend_from_slice(b"\r\n");
+            } else {
+                b.push(b'\n');
+            }
             b
         };
         let relative_ts = (start_ticks as i64 - current_cluster_ts as i64) as i16;
