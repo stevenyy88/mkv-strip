@@ -2011,6 +2011,13 @@ fn cmd_add(
     writer.write_all(&[0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])?; // 8-byte placeholder
     let content_start = writer.stream_position()?;
 
+    // Write SeekHead placeholder (we'll patch it after writing everything)
+    let seek_head_pos = writer.stream_position()?;
+    // Write a minimal SeekHead placeholder: 4-byte ID + 1-byte size = 5 bytes
+    // We'll rewrite it later once we know the positions
+    // For now, write a Void placeholder of 120 bytes (enough for SeekHead with Cues + Tags)
+    write_void_fill(&mut writer, 120)?;
+
     // Write metadata (Info, updated Tracks, Attachments, Chapters)
     seg_view.info.write_to(&mut writer)?;
     updated_tracks.write_to(&mut writer)?;
@@ -2116,6 +2123,7 @@ fn cmd_add(
     // cue_entries: map of (track_number, timestamp) -> cluster_position
     let mut cue_entries: Vec<(u64, u64, u64)> = Vec::new(); // (track_num, timestamp, cluster_pos)
     let mut _cluster_count: u64 = 0;
+    let cues_pos: u64; // set before writing Cues
 
     for cluster in &all_clusters {
         let cluster_pos = writer.stream_position()? - content_start; // position relative to Segment data start
@@ -2142,25 +2150,38 @@ fn cmd_add(
     }
 
     // Build and write Cues element for seeking
-    // Group cue entries by (track, timestamp) and keep the first occurrence
-    let mut seen: HashSet<(u64, u64)> = HashSet::new();
-    let mut cue_points_map: HashMap<u64, Vec<(u64, u64)>> = HashMap::new(); // timestamp -> [(track, pos)]
+    //
+    // RFC 9559 §22 / Matroska XML Schema: CueTime is expressed in Segment Ticks
+    // (based on TimestampScale). The XML schema says: "Absolute timestamp of the
+    // seek point, expressed in Segment Ticks, which are based on TimestampScale".
+    // So CueTime = cluster_timestamp_in_ticks (NOT nanoseconds).
+
+    // Group: (track, cluster_position) -> first cluster timestamp
+    let mut cluster_cue_map: HashMap<(u64, u64), u64> = HashMap::new();
     for (tn, ts, pos) in &cue_entries {
-        if seen.insert((*tn, *ts)) {
-            cue_points_map.entry(*ts).or_default().push((*tn, *pos));
-        }
+        cluster_cue_map.entry((*tn, *pos)).or_insert(*ts);
     }
+
+    // Regroup by cluster_position -> [(track, segment_ticks)]
+    let mut pos_to_tracks: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+    for ((tn, pos), ts) in &cluster_cue_map {
+        pos_to_tracks.entry(*pos).or_default().push((*tn, *ts));
+    }
+
     let mut cue_points: Vec<CuePoint> = Vec::new();
-    let mut sorted_timestamps: Vec<u64> = cue_points_map.keys().copied().collect();
-    sorted_timestamps.sort();
-    for ts in sorted_timestamps {
-        let track_positions = cue_points_map.remove(&ts).unwrap();
-        let cue_track_positions: Vec<CueTrackPositions> = track_positions.iter()
-            .map(|(tn, pos)| CueTrackPositions {
+    let mut sorted_positions: Vec<u64> = pos_to_tracks.keys().copied().collect();
+    sorted_positions.sort();
+    for pos in sorted_positions {
+        let track_entries = pos_to_tracks.remove(&pos).unwrap();
+        // CueTime = cluster timestamp in Segment Ticks
+        let cue_time = track_entries[0].1;
+
+        let cue_track_positions: Vec<CueTrackPositions> = track_entries.iter()
+            .map(|(tn, _)| CueTrackPositions {
                 crc32: None,
                 void: None,
                 cue_track: CueTrack(*tn),
-                cue_cluster_position: CueClusterPosition(*pos),
+                cue_cluster_position: CueClusterPosition(pos),
                 cue_relative_position: None,
                 cue_duration: None,
                 cue_block_number: None,
@@ -2171,21 +2192,24 @@ fn cmd_add(
         cue_points.push(CuePoint {
             crc32: None,
             void: None,
-            cue_time: CueTime(ts),
+            cue_time: CueTime(cue_time),
             cue_track_positions,
         });
     }
+
+    let unique_tracks: HashSet<u64> = cue_entries.iter().map(|(tn,_,_)| *tn).collect();
     let cues = Cues {
         crc32: None,
         void: None,
         cue_point: cue_points,
     };
+    cues_pos = writer.stream_position()? - content_start;
     cues.write_to(&mut writer)?;
-    println!("Wrote {} cue points for {} tracks",
-        cues.cue_point.len(),
-        cue_entries.iter().map(|(tn,_,_)| tn).collect::<HashSet<_>>().len());
+    println!("Wrote {} cue points for {} track(s)",
+        cues.cue_point.len(), unique_tracks.len());
 
     // Write Tags (copy from original, unchanged)
+    let tags_pos = writer.stream_position()? - content_start;
     for tag in seg_view.tags.iter() {
         tag.write_to(&mut writer)?;
     }
@@ -2198,6 +2222,23 @@ fn cmd_add(
     writer.write_all(&size_bytes)?;
     let gap = 8 - size_bytes.len();
     write_void_fill(&mut writer, gap)?;
+
+    // Now write the SeekHead at the reserved position
+    // SeekHead is at offset 0 relative to content, Info is at offset 120 (after SeekHead placeholder)
+    // Cues position was tracked, Tags position was tracked
+    let info_seg_pos = 120; // Info starts right after the 120-byte SeekHead placeholder
+    let seek_head_element = build_seek_head(info_seg_pos, cues_pos, tags_pos);
+    let seek_head_data = seek_head_element;
+    let seek_head_size = seek_head_data.len();
+    writer.seek(SeekFrom::Start(seek_head_pos))?;
+    if seek_head_size <= 120 {
+        writer.write_all(&seek_head_data)?;
+        // Fill remaining space with Void
+        let remaining = 120 - seek_head_size;
+        if remaining > 0 {
+            write_void_fill(&mut writer, remaining)?;
+        }
+    }
 
     writer.seek(SeekFrom::End(0))?;
     writer.flush()?;
@@ -2386,6 +2427,52 @@ fn extract_track_numbers_from_cluster(body: &[u8]) -> Vec<u64> {
         pos = data_end;
     }
     track_numbers.into_iter().collect()
+}
+
+/// Build a SeekHead element containing entries for Info, Cues, and Tags.
+/// Positions are relative to the Segment data start.
+/// Returns raw EBML bytes.
+fn build_seek_head(info_pos: u64, cues_pos: u64, tags_pos: u64) -> Vec<u8> {
+    let mut seeks: Vec<u8> = Vec::new();
+
+    let build_seek = |element_id: u64, position: u64| -> Vec<u8> {
+        let id_bytes = match element_id {
+            0x1549A966 => vec![0x15, 0x49, 0xA9, 0x66], // Info
+            0x1C53BB6B => vec![0x1C, 0x53, 0xBB, 0x6B], // Cues
+            0x1254C367 => vec![0x12, 0x54, 0xC3, 0x67], // Tags
+            _ => vec![],
+        };
+        if id_bytes.is_empty() { return vec![]; }
+
+        // SeekID: ID=0x53AB, size=4, data=element_id (4 bytes)
+        let mut seek_id = vec![0x53, 0xAB, 0x84];
+        seek_id.extend_from_slice(&id_bytes);
+
+        // SeekPosition: ID=0x53AC, size, data=position
+        let pos_bytes = encode_vint_size(position);
+        let mut seek_pos = vec![0x53, 0xAC];
+        seek_pos.push(0x80 | pos_bytes.len() as u8);
+        seek_pos.extend_from_slice(&pos_bytes);
+
+        // Seek: ID=0x4DBB, size, data=seek_id + seek_pos
+        let inner = [seek_id.as_slice(), seek_pos.as_slice()].concat();
+        let mut seek = vec![0x4D, 0xBB];
+        let inner_size = encode_vint_size(inner.len() as u64);
+        seek.extend_from_slice(&inner_size);
+        seek.extend_from_slice(&inner);
+        seek
+    };
+
+    seeks.extend_from_slice(&build_seek(0x1549A966, info_pos));
+    seeks.extend_from_slice(&build_seek(0x1C53BB6B, cues_pos));
+    seeks.extend_from_slice(&build_seek(0x1254C367, tags_pos));
+
+    // SeekHead: ID=0x114D9B74, size, data=seeks
+    let mut seek_head = vec![0x11, 0x4D, 0x9B, 0x74];
+    let seeks_size = encode_vint_size(seeks.len() as u64);
+    seek_head.extend_from_slice(&seeks_size);
+    seek_head.extend_from_slice(&seeks);
+    seek_head
 }
 
 /// Encode a u64 as an EBML VInt into a buffer.
