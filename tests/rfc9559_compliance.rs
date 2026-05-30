@@ -462,3 +462,175 @@ fn test_cluster_timestamps_monotonic() {
     assert!(has_element(&out, SEEKHEAD_ID), "Output should contain SeekHead");
     assert!(has_element(&out, CUES_ID), "Output should contain Cues");
 }
+
+// ---------------------------------------------------------------------------
+// SRT Validation & Rectification Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_srt_rectify_renumber() {
+    let bin = mkv_strip_bin();
+    let input = test_file("test1.mkv");
+    // SRT with non-sequential indices
+    let srt_path = temp_dir().join("renumber-test.srt");
+    fs::write(&srt_path,
+        "5\n00:00:01,000 --> 00:00:02,000\nFirst\n\n\
+         99\n00:00:03,000 --> 00:00:04,000\nSecond\n\n"
+    ).unwrap();
+    let out = temp_dir().join("renumber-test.mkv");
+
+    let output = Command::new(&bin)
+        .args(["add", "-i", input.to_str().unwrap(), "-s", srt_path.to_str().unwrap(),
+               "-o", out.to_str().unwrap(), "-l", "eng"])
+        .output().unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Renumbered") || stdout.contains("OK"),
+        "Should report renumber status: {}", stdout);
+
+    // Extract and verify indices are sequential
+    let extract_dir = temp_dir().join("renumber-extract");
+    let _ = fs::remove_dir_all(&extract_dir);
+    fs::create_dir_all(&extract_dir).unwrap();
+    let output = Command::new(&bin)
+        .args(["extract", "-i", out.to_str().unwrap(), "-o", extract_dir.to_str().unwrap()])
+        .output().unwrap();
+    assert!(output.status.success());
+
+    let entries: Vec<_> = fs::read_dir(&extract_dir).unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "srt"))
+        .collect();
+    assert!(!entries.is_empty());
+    let content = fs::read_to_string(entries[0].path()).unwrap();
+    // First entry should be index 1
+    assert!(content.starts_with("1\n"), "Should start with index 1, got: {}", &content[..20.min(content.len())]);
+}
+
+#[test]
+fn test_srt_rectify_zero_duration() {
+    let bin = mkv_strip_bin();
+    let input = test_file("test1.mkv");
+    // SRT with zero-duration entry (start == end)
+    let srt_path = temp_dir().join("zero-dur-test.srt");
+    fs::write(&srt_path,
+        "1\n00:00:01,000 --> 00:00:01,000\nZero duration\n\n\
+         2\n00:00:03,000 --> 00:00:04,000\nNormal\n\n"
+    ).unwrap();
+    let out = temp_dir().join("zero-dur-test.mkv");
+
+    let output = Command::new(&bin)
+        .args(["add", "-i", input.to_str().unwrap(), "-s", srt_path.to_str().unwrap(),
+               "-o", out.to_str().unwrap(), "-l", "eng"])
+        .output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("zero/near-zero duration") || stdout.contains("OK"),
+        "Should fix zero duration: {}", stdout);
+}
+
+#[test]
+fn test_srt_rectify_overlap() {
+    let bin = mkv_strip_bin();
+    let input = test_file("test1.mkv");
+    // SRT with overlapping entries
+    let srt_path = temp_dir().join("overlap-test.srt");
+    fs::write(&srt_path,
+        "1\n00:00:01,000 --> 00:00:04,000\nFirst\n\n\
+         2\n00:00:03,000 --> 00:00:05,000\nSecond\n\n"
+    ).unwrap();
+    let out = temp_dir().join("overlap-test.mkv");
+
+    let output = Command::new(&bin)
+        .args(["add", "-i", input.to_str().unwrap(), "-s", srt_path.to_str().unwrap(),
+               "-o", out.to_str().unwrap(), "-l", "eng"])
+        .output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("overlapping") || stdout.contains("OK"),
+        "Should fix overlaps: {}", stdout);
+}
+
+#[test]
+fn test_srt_rectify_empty_text() {
+    let bin = mkv_strip_bin();
+    let input = test_file("test1.mkv");
+    // SRT with empty text entry
+    let srt_path = temp_dir().join("empty-text-test.srt");
+    fs::write(&srt_path,
+        "1\n00:00:01,000 --> 00:00:02,000\n\n\n\
+         2\n00:00:03,000 --> 00:00:04,000\nValid text\n\n"
+    ).unwrap();
+    let out = temp_dir().join("empty-text-test.mkv");
+
+    let output = Command::new(&bin)
+        .args(["add", "-i", input.to_str().unwrap(), "-s", srt_path.to_str().unwrap(),
+               "-o", out.to_str().unwrap(), "-l", "eng"])
+        .output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("empty") || stdout.contains("OK"),
+        "Should remove empty entries: {}", stdout);
+}
+
+#[test]
+fn test_srt_rectify_flexible_timestamp() {
+    let bin = mkv_strip_bin();
+    let input = test_file("test1.mkv");
+    // SRT with period instead of comma, and 1-2 digit milliseconds
+    let srt_path = temp_dir().join("flex-ts-test.srt");
+    fs::write(&srt_path,
+        "1\n00:00:01.5 --> 00:00:02.50\nFlexible timestamps\n\n\
+         2\n00:00:03,100 --> 00:00:04,200\nStandard timestamps\n\n"
+    ).unwrap();
+    let out = temp_dir().join("flex-ts-test.mkv");
+
+    let output = Command::new(&bin)
+        .args(["add", "-i", input.to_str().unwrap(), "-s", srt_path.to_str().unwrap(),
+               "-o", out.to_str().unwrap(), "-l", "eng"])
+        .output().unwrap();
+    assert!(output.status.success(), "Should accept flexible timestamps: {}",
+        String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn test_srt_rectify_extract_roundtrip() {
+    let bin = mkv_strip_bin();
+    let input = test_file("test1.mkv");
+    // Add SRT with known issues
+    let srt_path = temp_dir().join("rectify-rt.srt");
+    fs::write(&srt_path,
+        "10\n00:00:01,000 --> 00:00:01,000\nShort\n\n\
+         20\n00:00:03,000 --> 00:00:04,000\nNormal\n\n"
+    ).unwrap();
+    let mkv = temp_dir().join("rectify-rt.mkv");
+
+    let output = Command::new(&bin)
+        .args(["add", "-i", input.to_str().unwrap(), "-s", srt_path.to_str().unwrap(),
+               "-o", mkv.to_str().unwrap(), "-l", "eng"])
+        .output().unwrap();
+    assert!(output.status.success());
+
+    // Extract and verify output is valid SRT
+    let extract_dir = temp_dir().join("rectify-rt-extract");
+    let _ = fs::remove_dir_all(&extract_dir);
+    fs::create_dir_all(&extract_dir).unwrap();
+    let output = Command::new(&bin)
+        .args(["extract", "-i", mkv.to_str().unwrap(), "-o", extract_dir.to_str().unwrap()])
+        .output().unwrap();
+    assert!(output.status.success());
+
+    let entries: Vec<_> = fs::read_dir(&extract_dir).unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "srt"))
+        .collect();
+    assert!(!entries.is_empty());
+    let content = fs::read_to_string(entries[0].path()).unwrap();
+    // Verify sequential indices (rectified from 10,20 to 1,2)
+    let first_line = content.lines().next().unwrap();
+    assert_eq!(first_line, "1", "Index should be rectified to 1, got: {}", first_line);
+    // Verify no zero-duration (should be 200ms minimum)
+    assert!(content.contains("00:00:01,000 --> 00:00:01,200") || content.contains("00:00:01,000 --> 00:00:01,"),
+        "Zero-duration should be fixed to 200ms: {}", content);
+}

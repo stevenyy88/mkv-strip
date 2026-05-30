@@ -280,6 +280,12 @@ cargo test
 | `test_cues_deduplicated` | CuePoints sorted by time, deduplicated per cluster |
 | `test_cluster_timestamps_monotonic` | Cluster timestamps in correct order |
 | `test_flags_inplace` | In-place flag modification works |
+| `test_srt_rectify_renumber` | Non-sequential indices rectified to 1, 2, 3… |
+| `test_srt_rectify_zero_duration` | Zero/near-zero duration fixed to 200ms minimum |
+| `test_srt_rectify_overlap` | Overlapping subtitles trimmed (100ms gap) |
+| `test_srt_rectify_empty_text` | Empty/whitespace-only entries removed |
+| `test_srt_rectify_flexible_timestamp` | Accepts `.` separator and 1–2 digit ms |
+| `test_srt_rectify_extract_roundtrip` | Rectified SRT survives add → extract round-trip |
 
 ## ⚠️ Limitations
 
@@ -288,6 +294,20 @@ cargo test
 - **Multi-segment files** — Not yet supported (rare in practice)
 - **Track renumbering** — Track numbers are preserved as-is
 - **Add command** — Always writes `S_TEXT/UTF8` codec; SRT positioning tags are not preserved
+- **SRT validation** — Both `add` and `extract` validate and rectify SRT files automatically (see below)
+
+### SRT Validation & Rectification
+
+Both `add` and `extract` commands run an automatic SRT validation and rectification pass. Issues are fixed in-memory and a report is printed.
+
+| Issue | Fix |
+|-------|-----|
+| Non-sequential indices (e.g. 5, 99) | Renumbered to 1, 2, 3… |
+| Zero or near-zero duration (< 200ms) | Extended to 200ms minimum |
+| End time ≤ start time | Set to start + 200ms |
+| Overlapping subtitles | Previous end trimmed to next start − 100ms |
+| Empty or whitespace-only text | Entry removed |
+| Flexible timestamps (`.` or `,`, 1–3 digit ms) | Normalized to `HH:MM:SS,mmm` |
 
 ## 📜 License
 

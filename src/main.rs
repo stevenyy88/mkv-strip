@@ -444,25 +444,179 @@ fn parse_srt(content: &str) -> Result<Vec<SrtEntry>> {
 }
 
 /// Parse an SRT timestamp like "00:01:23,456" into milliseconds.
+/// Accepts flexible formats and normalizes to strict SRT.
 fn parse_srt_timestamp(s: &str) -> Result<u64> {
-    // Handle both comma and period as decimal separator
     let s = s.trim();
+    if s.is_empty() {
+        bail!("Empty timestamp");
+    }
+    // Normalize: accept both comma and period as decimal separator
     let s = s.replace('.', ",");
 
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() != 3 {
-        bail!("Invalid SRT timestamp: '{}'", s);
+        bail!("Invalid SRT timestamp (expected HH:MM:SS,mmm): '{}'", s);
     }
-    let h: u64 = parts[0].parse().context("Invalid hours")?;
-    let m: u64 = parts[1].parse().context("Invalid minutes")?;
+    let h: u64 = parts[0].parse().context("Invalid hours in timestamp")?;
+    let m: u64 = parts[1].parse().context("Invalid minutes in timestamp")?;
     let sec_parts: Vec<&str> = parts[2].split(',').collect();
     if sec_parts.len() != 2 {
-        bail!("Invalid SRT timestamp seconds: '{}'", parts[2]);
+        bail!("Invalid SRT timestamp seconds (expected SS,mmm): '{}'", parts[2]);
     }
-    let sec: u64 = sec_parts[0].parse().context("Invalid seconds")?;
-    let ms: u64 = sec_parts[1].parse().context("Invalid milliseconds")?;
+    let sec: u64 = sec_parts[0].parse().context("Invalid seconds in timestamp")?;
+    let ms_str = sec_parts[1];
+    // Accept 1-3 digit milliseconds, right-pad with zeros
+    let ms: u64 = match ms_str.len() {
+        1 => ms_str.parse::<u64>()? * 100,
+        2 => ms_str.parse::<u64>()? * 10,
+        3 => ms_str.parse()?,
+        _ => bail!("Invalid milliseconds in timestamp (1-3 digits): '{}'", ms_str),
+    };
+
+    // Validate ranges
+    if m > 59 {
+        bail!("Minutes out of range (0-59): {}", m);
+    }
+    if sec > 59 {
+        bail!("Seconds out of range (0-59): {}", sec);
+    }
 
     Ok(h * 3_600_000 + m * 60_000 + sec * 1000 + ms)
+}
+
+/// Rectification report: records all issues found and fixes applied.
+#[derive(Debug, Default)]
+struct SrtRectifyReport {
+    total_entries: usize,
+    renumbered: bool,
+    fixed_overlaps: usize,
+    fixed_zero_duration: usize,
+    fixed_end_before_start: usize,
+    fixed_empty_text: usize,
+    fixed_whitespace_text: usize,
+    warnings: Vec<String>,
+}
+
+impl SrtRectifyReport {
+    fn has_fixes(&self) -> bool {
+        self.renumbered ||
+        self.fixed_overlaps > 0 ||
+        self.fixed_zero_duration > 0 ||
+        self.fixed_end_before_start > 0 ||
+        self.fixed_empty_text > 0 ||
+        self.fixed_whitespace_text > 0
+    }
+
+    fn print(&self) {
+        if !self.has_fixes() && self.warnings.is_empty() {
+            println!("  SRT validation: OK ({} entries, no issues)", self.total_entries);
+            return;
+        }
+        println!("  SRT rectification report ({} entries):", self.total_entries);
+        if self.renumbered {
+            println!("    ⚠ Renumbered sequence indices");
+        }
+        if self.fixed_overlaps > 0 {
+            println!("    ⚠ Fixed {} overlapping subtitle(s) (trimmed end time)", self.fixed_overlaps);
+        }
+        if self.fixed_zero_duration > 0 {
+            println!("    ⚠ Fixed {} zero/near-zero duration subtitle(s) (set 200ms minimum)", self.fixed_zero_duration);
+        }
+        if self.fixed_end_before_start > 0 {
+            println!("    ⚠ Fixed {} subtitle(s) with end ≤ start (set end = start + 200ms)", self.fixed_end_before_start);
+        }
+        if self.fixed_empty_text > 0 {
+            println!("    ⚠ Removed {} empty/whitespace-only subtitle(s)", self.fixed_empty_text);
+        }
+        if self.fixed_whitespace_text > 0 {
+            println!("    ⚠ Trimmed {} subtitle(s) with excess whitespace", self.fixed_whitespace_text);
+        }
+        for w in &self.warnings {
+            println!("    ⚠ {}", w);
+        }
+    }
+}
+
+/// Validate and rectify a list of SRT entries in-place.
+///
+/// Enforces the SRT specification:
+/// - Sequence numbers must be sequential starting from 1
+/// - Timestamps must be HH:MM:SS,mmm (2-2-3 digits, comma separator)
+/// - End time must be strictly after start time
+/// - Minimum duration: 200ms (prevents invisible subtitles)
+/// - No overlapping subtitles (end trimmed to next start - 100ms gap)
+/// - Text must not be empty or whitespace-only
+///
+/// Returns a report of all issues found and fixes applied.
+fn rectify_srt(entries: &mut Vec<SrtEntry>) -> SrtRectifyReport {
+    let mut report = SrtRectifyReport::default();
+    report.total_entries = entries.len();
+
+    // 1. Remove empty/whitespace-only entries
+    let before = entries.len();
+    entries.retain(|e| !e.text.trim().is_empty());
+    let removed = before - entries.len();
+    if removed > 0 {
+        report.fixed_empty_text = removed;
+    }
+
+    // 2. Trim whitespace from text
+    for entry in entries.iter_mut() {
+        let trimmed = entry.text.trim().to_string();
+        if trimmed != entry.text {
+            report.fixed_whitespace_text += 1;
+            entry.text = trimmed;
+        }
+    }
+
+    // 3. Fix end-before-start and zero-duration
+    for entry in entries.iter_mut() {
+        if entry.end_ms <= entry.start_ms {
+            if entry.end_ms == entry.start_ms {
+                report.fixed_zero_duration += 1;
+            } else {
+                report.fixed_end_before_start += 1;
+            }
+            entry.end_ms = entry.start_ms + 200;
+        } else if entry.end_ms - entry.start_ms < 200 {
+            report.fixed_zero_duration += 1;
+            entry.end_ms = entry.start_ms + 200;
+        }
+    }
+
+    // 4. Fix overlaps: if an entry starts before the previous one ends, trim the previous end
+    entries.sort_by_key(|e| e.start_ms);
+    for i in 1..entries.len() {
+        if entries[i].start_ms < entries[i - 1].end_ms {
+            report.fixed_overlaps += 1;
+            // Trim previous entry's end to 100ms before current start (if possible)
+            let new_end = if entries[i].start_ms > 100 {
+                entries[i].start_ms - 100
+            } else {
+                entries[i].start_ms
+            };
+            if new_end > entries[i - 1].start_ms {
+                entries[i - 1].end_ms = new_end;
+            }
+        }
+    }
+
+    // 5. Renumber indices sequentially from 1
+    let mut needs_renumber = false;
+    for (i, entry) in entries.iter().enumerate() {
+        if entry.index as usize != i + 1 {
+            needs_renumber = true;
+            break;
+        }
+    }
+    if needs_renumber {
+        report.renumbered = true;
+        for (i, entry) in entries.iter_mut().enumerate() {
+            entry.index = (i + 1) as u32;
+        }
+    }
+
+    report
 }
 
 // ---------------------------------------------------------------------------
@@ -1770,18 +1924,22 @@ fn cmd_extract(
         let srt_filename = format!("{}.{}.{}{}.srt", sanitize_filename(base_name), track.number, lang_suffix, name_suffix);
         let srt_path = out_dir.join(&srt_filename);
 
-        let mut srt_content = String::new();
-        for (i, (ts_ms, duration_ms, data)) in frames.iter().enumerate() {
-            let start = *ts_ms;
-            let end = *ts_ms + duration_ms.unwrap_or(2000); // default 2s if no duration
-            let text = String::from_utf8_lossy(data);
-
-            let entry = SrtEntry {
+        // Build SRT entries from extracted frames
+        let mut srt_entries: Vec<SrtEntry> = frames.iter().enumerate().map(|(i, (ts_ms, duration_ms, data))| {
+            SrtEntry {
                 index: (i + 1) as u32,
-                start_ms: start,
-                end_ms: end,
-                text: text.to_string(),
-            };
+                start_ms: *ts_ms,
+                end_ms: *ts_ms + duration_ms.unwrap_or(2000),
+                text: String::from_utf8_lossy(data).to_string(),
+            }
+        }).collect();
+
+        // Validate and rectify extracted subtitles
+        let report = rectify_srt(&mut srt_entries);
+        report.print();
+
+        let mut srt_content = String::new();
+        for entry in &srt_entries {
             srt_content.push_str(&entry.to_srt());
         }
 
@@ -1820,7 +1978,7 @@ fn cmd_add(
     // Parse the SRT file
     let srt_content = std::fs::read_to_string(srt_path)
         .with_context(|| format!("Failed to read SRT file {}", srt_path.display()))?;
-    let srt_entries = parse_srt(&srt_content)
+    let mut srt_entries = parse_srt(&srt_content)
         .with_context(|| format!("Failed to parse SRT file {}", srt_path.display()))?;
 
     if srt_entries.is_empty() {
@@ -1828,6 +1986,13 @@ fn cmd_add(
     }
 
     println!("Loaded {} subtitle(s) from {}", srt_entries.len(), srt_path.display());
+
+    // Validate and rectify the SRT entries
+    let report = rectify_srt(&mut srt_entries);
+    report.print();
+    if srt_entries.is_empty() {
+        bail!("SRT file contains no valid entries after rectification.");
+    }
 
     // Read metadata using MatroskaView (lightweight — no clusters loaded)
     let mut meta_reader = BufReader::new(File::open(input)?);
