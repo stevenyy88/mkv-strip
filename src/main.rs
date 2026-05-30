@@ -2127,7 +2127,16 @@ fn cmd_add(
             }
         }
 
-        let text_bytes = entry.text.as_bytes();
+        // SRT spec §3: text includes trailing newline within the MKV Block.
+        // The text itself is clean (no trailing whitespace from rectify_srt),
+        // but the Block content needs a trailing LF for proper subtitle display.
+        let text_bytes = if entry.text.ends_with('\n') {
+            entry.text.as_bytes().to_vec()
+        } else {
+            let mut b = entry.text.as_bytes().to_vec();
+            b.push(b'\n');
+            b
+        };
         let relative_ts = (start_ticks as i64 - current_cluster_ts as i64) as i16;
 
         // Calculate duration in track ticks for BlockDuration
@@ -2141,7 +2150,7 @@ fn cmd_add(
         // NOTE: Do NOT use 0x80 here — that's the keyframe bit for SimpleBlock.
         // In Block elements, bits 5-7 are reserved and must be 0.
         block_data.push(0x00);
-        block_data.extend_from_slice(text_bytes);
+        block_data.extend_from_slice(&text_bytes);
 
         // Use BlockGroup with BlockDuration — text subtitles need explicit
         // duration for players to know when to hide the subtitle.
