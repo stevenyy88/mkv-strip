@@ -274,6 +274,13 @@ fn test_add_extract_roundtrip() {
     let extracted = fs::read_to_string(entries[0].path()).unwrap();
     assert!(extracted.contains("First line"), "Extracted SRT missing first subtitle");
     assert!(extracted.contains("Second line"), "Extracted SRT missing second subtitle");
+    // Verify SRT spec compliance: blank line separates each entry
+    // Each entry should end with text\n\n (blank line before next index)
+    assert!(extracted.contains("First line\n\n"),
+        "Missing blank line between entries (SRT spec §4): '{}'...", &extracted[..200.min(extracted.len())]);
+    assert!(extracted.contains("Second line\n\n"),
+        "Missing blank line after last entry: '{}'...",
+        &extracted[extracted.len().saturating_sub(100)..]);
 }
 
 // ---------------------------------------------------------------------------

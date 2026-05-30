@@ -353,7 +353,7 @@ impl SrtEntry {
 
     fn to_srt(&self) -> String {
         format!(
-            "{}\n{} --> {}\n{}\n",
+            "{}\n{} --> {}\n{}\n\n",
             self.index,
             Self::format_timestamp(self.start_ms),
             Self::format_timestamp(self.end_ms),
