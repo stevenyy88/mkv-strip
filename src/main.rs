@@ -1924,15 +1924,36 @@ fn cmd_extract(
         let srt_filename = format!("{}.{}.{}{}.srt", sanitize_filename(base_name), track.number, lang_suffix, name_suffix);
         let srt_path = out_dir.join(&srt_filename);
 
-        // Build SRT entries from extracted frames
-        let mut srt_entries: Vec<SrtEntry> = frames.iter().enumerate().map(|(i, (ts_ms, duration_ms, data))| {
-            SrtEntry {
+        // Build SRT entries from extracted frames.
+        // When no BlockDuration is present, compute duration from the gap to the
+        // next subtitle. Last entry defaults to 2000ms if no next timestamp exists.
+        let mut srt_entries: Vec<SrtEntry> = Vec::with_capacity(frames.len());
+        for (i, (ts_ms, duration_ms, data)) in frames.iter().enumerate() {
+            let end_ms = match duration_ms {
+                Some(d) => ts_ms + d,
+                None => {
+                    // Compute from next subtitle's start time, or default 2s
+                    let gap_ms = if i + 1 < frames.len() {
+                        let next_ts = frames[i + 1].0;
+                        if next_ts > *ts_ms { next_ts - *ts_ms } else { 2000 }
+                    } else {
+                        2000
+                    };
+                    // Cap at 10 seconds (subtitles shouldn't display longer than that)
+                    let duration = gap_ms.min(10_000).max(200);
+                    ts_ms + duration
+                }
+            };
+            let text = String::from_utf8_lossy(data);
+            // Trim trailing newlines/carriage returns that MKV players don't expect
+            let text = text.trim_end_matches(|c| c == '\n' || c == '\r').to_string();
+            srt_entries.push(SrtEntry {
                 index: (i + 1) as u32,
                 start_ms: *ts_ms,
-                end_ms: *ts_ms + duration_ms.unwrap_or(2000),
-                text: String::from_utf8_lossy(data).to_string(),
-            }
-        }).collect();
+                end_ms,
+                text,
+            });
+        }
 
         // Validate and rectify extracted subtitles
         let report = rectify_srt(&mut srt_entries);
@@ -2116,7 +2137,10 @@ fn cmd_add(
         let mut block_data = Vec::new();
         encode_vint(new_track_number, &mut block_data);
         block_data.extend_from_slice(&relative_ts.to_be_bytes());
-        block_data.push(0x80); // keyframe flag
+        // Flags byte: 0x00 for Block (no lacing, not invisible).
+        // NOTE: Do NOT use 0x80 here — that's the keyframe bit for SimpleBlock.
+        // In Block elements, bits 5-7 are reserved and must be 0.
+        block_data.push(0x00);
         block_data.extend_from_slice(text_bytes);
 
         // Use BlockGroup with BlockDuration — text subtitles need explicit
